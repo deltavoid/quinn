@@ -16,7 +16,7 @@ use slog::{self, Logger};
 
 use crate::coding::BufMutExt;
 use crate::connection::{
-    self, initial_close, ClientConfig, Connection, ConnectionError, TimerUpdate,
+    self, initial_close, ClientConfig, Connection, ConnectionError, EndpointEvent, TimerUpdate,
 };
 use crate::crypto::{
     self, reset_token_for, Crypto, CryptoClientConfig, CryptoServerConfig, RingHeaderCrypto,
@@ -134,12 +134,38 @@ impl Endpoint {
         loop {
             let &ch = self.needs_transmit.iter().next()?;
             loop {
+                while let Some(event) = self.connections[ch].poll_endpoint_events() {
+                    self.handle_event(ch, event);
+                }
                 if let Some(transmit) = self.connections[ch].poll_transmit(now) {
                     self.dirty_timers.insert(ch);
                     return Some(transmit);
                 } else {
                     self.needs_transmit.remove(&ch);
                     break;
+                }
+            }
+        }
+    }
+
+    pub fn handle_event(&mut self, ch: ConnectionHandle, event: EndpointEvent) {
+        match event {
+            EndpointEvent::Connected {
+                handshake_complete,
+                identifiers_needed,
+            } => {
+                if handshake_complete {
+                    self.incoming.push_back(ch);
+                }
+                if identifiers_needed {
+                    /// connection IDs
+                    const LOCAL_CID_COUNT: usize = 8;
+                    // We've already issued one CID as part of the normal handshake process.
+                    for _ in 1..LOCAL_CID_COUNT {
+                        let cid = self.new_cid();
+                        self.connection_ids.insert(cid, ch);
+                        self.connections[ch].issue_cid(cid);
+                    }
                 }
             }
         }
@@ -212,13 +238,7 @@ impl Endpoint {
                 .cloned()
         };
         if let Some(ch) = known_ch {
-            let had_1rtt = self.connections[ch].has_1rtt();
             self.connections[ch].handle_dgram(now, remote, ecn, partial_decode, rest);
-            if !had_1rtt
-                && (self.connections[ch].has_1rtt() || !self.connections[ch].is_handshaking())
-            {
-                self.conn_ready(ch);
-            }
             self.needs_transmit.insert(ch);
             self.dirty_timers.insert(ch);
             self.eventful_conns.insert(ch);
@@ -561,9 +581,6 @@ impl Endpoint {
                 trace!(self.log, "connection incoming; ICID {icid}", icid = dst_cid);
                 self.incoming_handshakes += 1;
                 self.needs_transmit.insert(ch);
-                if self.connections[ch].has_1rtt() {
-                    self.conn_ready(ch);
-                }
             }
             Err(e) => {
                 debug!(self.log, "handshake failed"; "reason" => %e);
@@ -573,24 +590,6 @@ impl Endpoint {
                     ecn: None,
                     packet: initial_close(crypto, header_crypto, &src_cid, &temp_loc_cid, 0, e),
                 });
-            }
-        }
-    }
-
-    /// Connection is either ready to accept data or failed.
-    fn conn_ready(&mut self, ch: ConnectionHandle) {
-        if self.connections[ch].side().is_server() {
-            self.incoming.push_back(ch);
-        }
-        if self.config.local_cid_len != 0 && !self.connections[ch].is_closed() {
-            /// Draft 17 §5.1.1: endpoints SHOULD provide and maintain at least eight
-            /// connection IDs
-            const LOCAL_CID_COUNT: usize = 8;
-            // We've already issued one CID as part of the normal handshake process.
-            for _ in 1..LOCAL_CID_COUNT {
-                let cid = self.new_cid();
-                self.connection_ids.insert(cid, ch);
-                self.connections[ch].issue_cid(cid);
             }
         }
     }

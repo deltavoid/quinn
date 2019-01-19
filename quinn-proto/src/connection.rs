@@ -70,6 +70,7 @@ pub struct Connection {
     lost_packets: u64,
     io: IoQueue,
     events: VecDeque<Event>,
+    endpoint_events: VecDeque<EndpointEvent>,
     /// Number of local connection IDs that have been issued in NEW_CONNECTION_ID frames.
     cids_issued: u64,
     /// Outgoing spin bit state
@@ -218,6 +219,7 @@ impl Connection {
             lost_packets: 0,
             io: IoQueue::new(),
             events: VecDeque::new(),
+            endpoint_events: VecDeque::new(),
             cids_issued: 0,
             spin: false,
             spaces: [initial_space, PacketSpace::new(), PacketSpace::new()],
@@ -312,6 +314,11 @@ impl Connection {
         }
 
         None
+    }
+
+    /// Return endpoint-facing events
+    pub fn poll_endpoint_events(&mut self) -> Option<EndpointEvent> {
+        self.endpoint_events.pop_front()
     }
 
     fn on_packet_sent(
@@ -1094,7 +1101,6 @@ impl Connection {
             connection = packet.header.dst_cid(),
         );
         let was_closed = self.state.is_closed();
-
         let stateless_reset = self.params.stateless_reset_token.map_or(false, |token| {
             packet.payload.len() >= RESET_TOKEN_SIZE
                 && packet.payload[packet.payload.len() - RESET_TOKEN_SIZE..] == token
@@ -1304,7 +1310,13 @@ impl Connection {
                             }
                             self.set_params(params)?;
                         }
+
                         self.events.push_back(Event::Connected);
+                        self.endpoint_events.push_back(EndpointEvent::Connected {
+                            handshake_complete: self.side.is_server(),
+                            identifiers_needed: self.endpoint_config.local_cid_len != 0,
+                        });
+
                         self.state = State::Established;
                         trace!(self.log, "established");
                         Ok(())
@@ -3296,6 +3308,14 @@ struct SentPacket {
 
 /// Ensures we can always fit all our ACKs in a single minimum-MTU packet with room to spare
 const MAX_ACK_BLOCKS: usize = 64;
+
+/// Events to be sent to the Endpoint
+pub enum EndpointEvent {
+    Connected {
+        handshake_complete: bool,
+        identifiers_needed: bool,
+    },
+}
 
 /// I/O operations to be immediately executed the backend.
 #[derive(Debug)]
