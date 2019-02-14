@@ -1,5 +1,8 @@
 use std::{mem, ptr};
 
+#[repr(align(8))] // Conservative bound for align_of<cmsghdr>
+pub struct Aligned<T>(pub T);
+
 pub struct Encoder<'a> {
     hdr: &'a mut libc::msghdr,
     cmsg: Option<&'a mut libc::cmsghdr>,
