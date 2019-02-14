@@ -7,16 +7,24 @@ pub struct Encoder<'a> {
 }
 
 impl<'a> Encoder<'a> {
-    pub fn new(hdr: &'a mut libc::msghdr, buf: &'a mut [u8]) -> Self {
+    /// # Safety
+    /// - `buf` must have the alignment of `cmsghdr`.
+    /// - The `Encoder` must be dropped before `hdr` is passed to a system call, and must not be leaked.
+    pub unsafe fn new(hdr: &'a mut libc::msghdr, buf: &'a mut [u8]) -> Self {
         hdr.msg_control = buf.as_mut_ptr() as _;
         hdr.msg_controllen = buf.len() as _;
         Self {
-            cmsg: unsafe { libc::CMSG_FIRSTHDR(hdr).as_mut() },
+            cmsg: libc::CMSG_FIRSTHDR(hdr).as_mut(),
             hdr,
             len: 0,
         }
     }
 
+    /// Append a control message to the buffer.
+    ///
+    /// # Panics
+    /// - If insufficient buffer space remains.
+    /// - If `T` has stricter alignment requirements than `cmsghdr`
     pub fn push<T: Copy + ?Sized>(&mut self, level: libc::c_int, ty: libc::c_int, value: T) {
         assert!(mem::align_of::<T>() <= mem::align_of::<libc::cmsghdr>());
         let space = unsafe { libc::CMSG_SPACE(mem::size_of_val(&value) as _) as usize };
@@ -34,8 +42,10 @@ impl<'a> Encoder<'a> {
         self.len += space;
         self.cmsg = unsafe { libc::CMSG_NXTHDR(self.hdr, cmsg).as_mut() };
     }
+}
 
-    pub fn finish(self) {
+impl<'a> Drop for Encoder<'a> {
+    fn drop(&mut self) {
         self.hdr.msg_controllen = self.len;
     }
 }
@@ -48,18 +58,18 @@ pub unsafe fn decode<T: Copy>(cmsg: &libc::cmsghdr) -> T {
 
 pub struct Iter<'a> {
     hdr: &'a libc::msghdr,
-    cmsg: *const libc::cmsghdr,
+    cmsg: Option<&'a libc::cmsghdr>,
 }
 
 impl<'a> Iter<'a> {
     /// # Safety
     ///
     /// `hdr.msg_control` must point to mutable memory containing at least `hdr.msg_controllen`
-    /// bytes, which lives at least as long as `'a`.
+    /// bytes, which lives at least as long as `'a` and have at least the alignment of `cmsghdr`.
     pub unsafe fn new(hdr: &'a libc::msghdr) -> Self {
         Self {
             hdr,
-            cmsg: libc::CMSG_FIRSTHDR(hdr),
+            cmsg: libc::CMSG_FIRSTHDR(hdr).as_ref(),
         }
     }
 }
@@ -67,11 +77,8 @@ impl<'a> Iter<'a> {
 impl<'a> Iterator for Iter<'a> {
     type Item = &'a libc::cmsghdr;
     fn next(&mut self) -> Option<&'a libc::cmsghdr> {
-        if self.cmsg.is_null() {
-            return None;
-        }
-        let current = self.cmsg;
-        self.cmsg = unsafe { libc::CMSG_NXTHDR(self.hdr, self.cmsg) };
-        Some(unsafe { &*current })
+        let current = self.cmsg.take()?;
+        self.cmsg = unsafe { libc::CMSG_NXTHDR(self.hdr, current).as_ref() };
+        Some(current)
     }
 }

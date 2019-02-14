@@ -99,7 +99,7 @@ impl super::UdpExt for UdpSocket {
         } else {
             encoder.push(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, ecn);
         }
-        encoder.finish();
+        mem::drop(encoder);
         loop {
             let n = unsafe { libc::sendmsg(self.as_raw_fd(), &hdr, 0) };
             if n == -1 {
