@@ -59,7 +59,8 @@ struct Opt {
     #[structopt(long = "stateless-retry")]
     stateless_retry: bool,
     /// Address to listen on
-    #[structopt(long = "listen", default_value = "[::1]:4433")]
+    //#[structopt(long = "listen", default_value = "[::1]:4433")]
+    #[structopt(long = "listen", default_value = "127.0.0.1:4433")]
     listen: SocketAddr,
 }
 
