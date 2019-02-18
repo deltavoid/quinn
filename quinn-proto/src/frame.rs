@@ -7,8 +7,8 @@ use crate::coding::{self, BufExt, BufMutExt, UnexpectedEnd};
 use crate::packet::EcnCodepoint;
 use crate::range_set::RangeSet;
 use crate::{
-    varint, ConnectionId, Directionality, StreamId, TransportError, MAX_CID_SIZE, MIN_CID_SIZE,
-    RESET_TOKEN_SIZE,
+    varint, ConnectionId, Directionality, StreamId, TransportError, TransportErrorCode,
+    MAX_CID_SIZE, MIN_CID_SIZE, RESET_TOKEN_SIZE,
 };
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -163,8 +163,10 @@ pub enum Frame {
     PathResponse(u64),
     ConnectionClose(ConnectionClose),
     ApplicationClose(ApplicationClose),
-    Invalid(Type),
-    Illegal(Type),
+    Invalid {
+        ty: Type,
+        reason: &'static str,
+    },
 }
 
 impl Frame {
@@ -200,7 +202,7 @@ impl Frame {
             RetireConnectionId { .. } => Type::RETIRE_CONNECTION_ID,
             Ack(_) => Type::ACK,
             Stream(ref x) => {
-                let mut ty = 0x10;
+                let mut ty = STREAM_TY_MIN;
                 if x.fin {
                     ty |= 0x01;
                 }
@@ -214,15 +216,14 @@ impl Frame {
             NewConnectionId { .. } => Type::NEW_CONNECTION_ID,
             Crypto(_) => Type::CRYPTO,
             NewToken { .. } => Type::NEW_TOKEN,
-            Invalid(ty) => ty,
-            Illegal(ty) => ty,
+            Invalid { ty, .. } => ty,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ConnectionClose {
-    pub error_code: TransportError,
+    pub error_code: TransportErrorCode,
     pub frame_type: Option<Type>,
     pub reason: Bytes,
 }
@@ -241,9 +242,9 @@ impl fmt::Display for ConnectionClose {
 impl From<TransportError> for ConnectionClose {
     fn from(x: TransportError) -> Self {
         ConnectionClose {
-            error_code: x,
-            frame_type: None,
-            reason: Bytes::new(),
+            error_code: x.code,
+            frame_type: x.frame,
+            reason: x.reason.into(),
         }
     }
 }
@@ -452,7 +453,17 @@ enum IterErr {
     UnexpectedEnd,
     InvalidFrameId,
     Malformed,
-    Illegal,
+}
+
+impl IterErr {
+    fn reason(&self) -> &'static str {
+        use self::IterErr::*;
+        match *self {
+            UnexpectedEnd => "unexpected end",
+            InvalidFrameId => "invalid frame ID",
+            Malformed => "malformed",
+        }
+    }
 }
 
 impl From<UnexpectedEnd> for IterErr {
@@ -480,13 +491,8 @@ impl Iter {
     }
 
     fn try_next(&mut self) -> Result<Frame, IterErr> {
-        let ty_start = self.bytes.position();
         let ty = self.bytes.get::<Type>()?;
         self.last_ty = Some(ty);
-        let ty_len = (self.bytes.position() - ty_start) as usize;
-        if varint::size(ty.0).unwrap() != ty_len {
-            return Err(IterErr::Illegal);
-        }
         Ok(match ty {
             Type::PADDING => Frame::Padding,
             Type::RESET_STREAM => Frame::ResetStream(ResetStream {
@@ -634,9 +640,9 @@ impl Iterator for Iter {
             Err(e) => {
                 // Corrupt frame, skip it and everything that follows
                 self.bytes = io::Cursor::new(Bytes::new());
-                Some(match e {
-                    IterErr::Illegal => Frame::Illegal(self.last_ty.unwrap()),
-                    _ => Frame::Invalid(self.last_ty.unwrap()),
+                Some(Frame::Invalid {
+                    ty: self.last_ty.unwrap(),
+                    reason: e.reason(),
                 })
             }
         }

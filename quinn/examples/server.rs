@@ -6,6 +6,7 @@ extern crate slog;
 use std::net::SocketAddr;
 use std::path::{self, Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::{ascii, fmt, fs, io, str};
 
 use failure::{Error, Fail, ResultExt};
@@ -83,8 +84,15 @@ fn main() {
 }
 
 fn run(log: Logger, options: Opt) -> Result<()> {
-    let mut server_config = quinn::ServerConfigBuilder::default();
-    server_config.set_protocols(&[quinn::ALPN_QUIC_HTTP]);
+    let server_config = quinn::ServerConfig {
+        transport_config: Arc::new(quinn::TransportConfig {
+            stream_window_uni: 0,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut server_config = quinn::ServerConfigBuilder::new(server_config);
+    server_config.protocols(&[quinn::ALPN_QUIC_HTTP]);
 
     if options.keylog {
         server_config.enable_keylog();
@@ -107,7 +115,7 @@ fn run(log: Logger, options: Opt) -> Result<()> {
         } else {
             quinn::CertificateChain::from_pem(&cert_chain)?
         };
-        server_config.set_certificate(cert_chain, key)?;
+        server_config.certificate(cert_chain, key)?;
     } else {
         let dirs = directories::ProjectDirs::from("org", "quinn", "quinn-examples").unwrap();
         let path = dirs.data_local_dir();
@@ -131,7 +139,7 @@ fn run(log: Logger, options: Opt) -> Result<()> {
         };
         let key = quinn::PrivateKey::from_der(&key)?;
         let cert = quinn::Certificate::from_der(&cert)?;
-        server_config.set_certificate(quinn::CertificateChain::from_certs(vec![cert]), key)?;
+        server_config.certificate(quinn::CertificateChain::from_certs(vec![cert]), key)?;
     }
 
     let mut endpoint = quinn::Endpoint::new();
@@ -181,7 +189,7 @@ fn handle_connection(root: &PathBuf, log: &Logger, conn: quinn::NewConnection) {
 fn handle_request(root: &PathBuf, log: &Logger, stream: quinn::NewStream) {
     let stream = match stream {
         quinn::NewStream::Bi(stream) => stream,
-        quinn::NewStream::Uni(_) => unreachable!(), // config.max_remote_uni_streams is defaulted to 0
+        quinn::NewStream::Uni(_) => unreachable!("disabled by endpoint configuration"),
     };
     let root = root.clone();
     let log = log.clone();

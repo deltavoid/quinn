@@ -5,14 +5,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{io, str};
 
 use bytes::{Buf, BufMut, BytesMut};
-use err_derive::Error;
 use ring::aead::quic::{HeaderProtectionKey, AES_128, AES_256, CHACHA20};
 use ring::aead::{self, Aad, Nonce};
 use ring::digest;
 use ring::hkdf;
 use ring::hmac::{self, SigningKey};
-pub use rustls::quic::Secrets;
-use rustls::quic::{ClientQuicExt, ServerQuicExt};
+use rustls::quic::{ClientQuicExt, Secrets, ServerQuicExt};
 use rustls::ProtocolVersion;
 pub use rustls::{Certificate, NoClientAuth, PrivateKey, TLSError};
 pub use rustls::{ClientConfig, ClientSession, ServerConfig, ServerSession, Session};
@@ -21,7 +19,7 @@ use webpki::DNSNameRef;
 use crate::coding::{BufExt, BufMutExt};
 use crate::packet::{ConnectionId, PacketNumber, LONG_HEADER_FORM};
 use crate::transport_parameters::TransportParameters;
-use crate::{Side, MAX_CID_SIZE, MIN_CID_SIZE, RESET_TOKEN_SIZE};
+use crate::{ConnectError, Side, TransportError, MAX_CID_SIZE, MIN_CID_SIZE, RESET_TOKEN_SIZE};
 
 pub enum TlsSession {
     Client(ClientSession),
@@ -29,41 +27,126 @@ pub enum TlsSession {
 }
 
 impl TlsSession {
-    pub fn new_client(
-        config: &Arc<ClientConfig>,
-        hostname: &str,
+    fn side(&self) -> Side {
+        match self {
+            TlsSession::Client(_) => Side::Client,
+            TlsSession::Server(_) => Side::Server,
+        }
+    }
+}
+
+impl CryptoSession for TlsSession {
+    fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.get_alpn_protocol()
+    }
+
+    fn early_crypto(&self) -> Option<Crypto> {
+        self.get_early_secret()
+            .map(|secret| Crypto::new_0rtt(secret))
+    }
+
+    fn early_data_accepted(&self) -> Option<bool> {
+        match self {
+            TlsSession::Client(session) => Some(session.is_early_data_accepted()),
+            _ => None,
+        }
+    }
+
+    fn is_handshaking(&self) -> bool {
+        match self {
+            TlsSession::Client(session) => session.is_handshaking(),
+            TlsSession::Server(session) => session.is_handshaking(),
+        }
+    }
+
+    fn read_handshake(&mut self, buf: &[u8]) -> Result<(), TransportError> {
+        self.read_hs(buf).map_err(|e| {
+            if let Some(alert) = self.get_alert() {
+                TransportError::crypto(alert.get_u8(), e.to_string())
+            } else {
+                TransportError::PROTOCOL_VIOLATION(format!("TLS error: {}", e))
+            }
+        })
+    }
+
+    fn sni_hostname(&self) -> Option<&str> {
+        match self {
+            TlsSession::Client(_) => None,
+            TlsSession::Server(session) => session.get_sni_hostname(),
+        }
+    }
+
+    fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
+        match self.get_quic_transport_parameters() {
+            None => Ok(None),
+            Some(buf) => match TransportParameters::read(self.side(), &mut io::Cursor::new(buf)) {
+                Ok(params) => Ok(Some(params)),
+                Err(e) => Err(e.into()),
+            },
+        }
+    }
+
+    fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Crypto> {
+        let secrets = self.write_hs(buf)?;
+        let suite = self
+            .get_negotiated_ciphersuite()
+            .expect("should not get secrets without cipher suite");
+        Some(Crypto::new(
+            self.side(),
+            suite.get_hash(),
+            suite.get_aead_alg(),
+            secrets,
+        ))
+    }
+}
+
+pub trait CryptoSession {
+    fn alpn_protocol(&self) -> Option<&[u8]>;
+    fn early_crypto(&self) -> Option<Crypto>;
+    fn early_data_accepted(&self) -> Option<bool>;
+    fn is_handshaking(&self) -> bool;
+    fn read_handshake(&mut self, buf: &[u8]) -> Result<(), TransportError>;
+    fn sni_hostname(&self) -> Option<&str>;
+    fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError>;
+    fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Crypto>;
+}
+
+impl CryptoClientConfig for Arc<ClientConfig> {
+    type Session = TlsSession;
+    fn start_session(
+        &self,
+        server_name: &str,
         params: &TransportParameters,
-    ) -> Result<TlsSession, ConnectError> {
-        let pki_server_name = DNSNameRef::try_from_ascii_str(hostname)
-            .map_err(|_| ConnectError::InvalidDnsName(hostname.into()))?;
+    ) -> Result<Self::Session, ConnectError> {
+        let pki_server_name = DNSNameRef::try_from_ascii_str(server_name)
+            .map_err(|_| ConnectError::InvalidDnsName(server_name.into()))?;
         Ok(TlsSession::Client(ClientSession::new_quic(
-            &config,
+            self,
             pki_server_name,
             to_vec(Side::Client, params),
         )))
     }
+}
 
-    pub fn new_server(config: &Arc<ServerConfig>, params: &TransportParameters) -> TlsSession {
-        TlsSession::Server(ServerSession::new_quic(
-            config,
-            to_vec(Side::Server, params),
-        ))
-    }
+pub trait CryptoClientConfig {
+    type Session: CryptoSession;
+    fn start_session(
+        &self,
+        server_name: &str,
+        params: &TransportParameters,
+    ) -> Result<Self::Session, ConnectError>;
+}
 
-    pub fn get_sni_hostname(&self) -> Option<&str> {
-        match *self {
-            TlsSession::Client(_) => None,
-            TlsSession::Server(ref session) => session.get_sni_hostname(),
-        }
+impl CryptoServerConfig for Arc<ServerConfig> {
+    type Session = TlsSession;
+    fn start_session(&self, params: &TransportParameters) -> Self::Session {
+        TlsSession::Server(ServerSession::new_quic(self, to_vec(Side::Server, params)))
     }
+}
 
-    pub fn as_client(&self) -> &ClientSession {
-        if let TlsSession::Client(ref session) = *self {
-            session
-        } else {
-            panic!("not a client");
-        }
-    }
+pub trait CryptoServerConfig {
+    type Session: CryptoSession;
+    fn start_session(&self, params: &TransportParameters) -> Self::Session;
 }
 
 impl Deref for TlsSession {
@@ -133,7 +216,7 @@ impl Crypto {
         Self::new(side, digest, cipher, secrets)
     }
 
-    pub fn new_0rtt(secret: &[u8]) -> Self {
+    fn new_0rtt(secret: &[u8]) -> Self {
         Self::new(
             Side::Client, // Meaningless when the secrets are equal
             &digest::SHA256,
@@ -145,7 +228,7 @@ impl Crypto {
         )
     }
 
-    pub fn new(
+    fn new(
         side: Side,
         digest: &'static digest::Algorithm,
         cipher: &'static aead::Algorithm,
@@ -170,7 +253,7 @@ impl Crypto {
         }
     }
 
-    pub fn write_nonce(&self, iv: &[u8], number: u64, out: &mut [u8]) {
+    fn write_nonce(&self, iv: &[u8], number: u64, out: &mut [u8]) {
         let out = {
             let mut write = io::Cursor::new(out);
             write.put_u32_be(0);
@@ -242,11 +325,11 @@ impl Crypto {
         (key, iv)
     }
 
-    pub fn header_crypto(&self) -> HeaderCrypto {
+    pub fn header_crypto(&self) -> RingHeaderCrypto {
         let local = SigningKey::new(self.digest, &self.local_secret);
         let remote = SigningKey::new(self.digest, &self.remote_secret);
         let cipher = self.sealing_key.algorithm();
-        HeaderCrypto {
+        RingHeaderCrypto {
             local: header_key_from_secret(cipher, &local),
             remote: header_key_from_secret(cipher, &remote),
         }
@@ -267,13 +350,13 @@ impl Crypto {
     }
 }
 
-pub struct HeaderCrypto {
+pub struct RingHeaderCrypto {
     local: HeaderProtectionKey,
     remote: HeaderProtectionKey,
 }
 
-impl HeaderCrypto {
-    pub fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
+impl HeaderCrypto for RingHeaderCrypto {
+    fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
         let (header, sample) = packet.split_at_mut(pn_offset + 4);
         let mask = self
             .remote
@@ -295,7 +378,7 @@ impl HeaderCrypto {
         }
     }
 
-    pub fn encrypt(&self, pn_offset: usize, packet: &mut [u8]) {
+    fn encrypt(&self, pn_offset: usize, packet: &mut [u8]) {
         let (header, sample) = packet.split_at_mut(pn_offset + 4);
         let mask = self.local.new_mask(&sample[0..self.sample_size()]).unwrap();
         let pn_length = PacketNumber::decode_len(header[0]);
@@ -314,28 +397,15 @@ impl HeaderCrypto {
         }
     }
 
-    pub fn sample_size(&self) -> usize {
+    fn sample_size(&self) -> usize {
         self.local.algorithm().sample_len()
     }
 }
 
-/// Errors in the parameters being used to create a new connection
-///
-/// These arise before any I/O has been performed.
-#[derive(Debug, Error)]
-pub enum ConnectError {
-    /// The domain name supplied was malformed
-    #[error(display = "invalid DNS name: {}", _0)]
-    InvalidDnsName(String),
-    /// The TLS configuration was invalid
-    #[error(display = "TLS error: {}", _0)]
-    Tls(TLSError),
-}
-
-impl From<TLSError> for ConnectError {
-    fn from(x: TLSError) -> Self {
-        ConnectError::Tls(x)
-    }
+pub trait HeaderCrypto {
+    fn decrypt(&self, pn_offset: usize, packet: &mut [u8]);
+    fn encrypt(&self, pn_offset: usize, packet: &mut [u8]);
+    fn sample_size(&self) -> usize;
 }
 
 fn header_key_from_secret(aead: &aead::Algorithm, secret_key: &SigningKey) -> HeaderProtectionKey {

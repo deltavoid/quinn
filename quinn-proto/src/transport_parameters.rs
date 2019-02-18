@@ -1,12 +1,14 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 use bytes::{Buf, BufMut};
 use err_derive::Error;
 
 use crate::coding::{BufExt, BufMutExt, UnexpectedEnd};
-use crate::endpoint::Config;
 use crate::packet::ConnectionId;
-use crate::{varint, Side, TransportError, MAX_CID_SIZE, MIN_CID_SIZE, RESET_TOKEN_SIZE, VERSION};
+use crate::{
+    varint, Side, TransportConfig, TransportError, MAX_CID_SIZE, MIN_CID_SIZE, RESET_TOKEN_SIZE,
+    VERSION,
+};
 
 // Apply a given macro to a list of all the transport parameters having integer types, along with
 // their codes and default values. Using this helps us avoid error-prone duplication of the
@@ -68,10 +70,10 @@ macro_rules! make_struct {
 apply_params!(make_struct);
 
 impl TransportParameters {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &TransportConfig) -> Self {
         TransportParameters {
-            initial_max_streams_bidi: config.stream_window_bidi as u64,
-            initial_max_streams_uni: config.stream_window_uni as u64,
+            initial_max_streams_bidi: config.stream_window_bidi,
+            initial_max_streams_uni: config.stream_window_uni,
             initial_max_data: config.receive_window,
             initial_max_stream_data_bidi_local: config.stream_receive_window,
             initial_max_stream_data_bidi_remote: config.stream_receive_window,
@@ -85,68 +87,33 @@ impl TransportParameters {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct PreferredAddress {
-    address: SocketAddr,
+    address_v4: Option<SocketAddrV4>,
+    address_v6: Option<SocketAddrV6>,
     connection_id: ConnectionId,
     stateless_reset_token: [u8; RESET_TOKEN_SIZE],
 }
 
 impl PreferredAddress {
     fn wire_size(&self) -> u16 {
-        let ip_len = match self.address {
-            SocketAddr::V4(_) => 4,
-            SocketAddr::V6(_) => 16,
-        };
-        2 + ip_len + 3 + self.connection_id.len() as u16 + 16
+        4 + 2 + 16 + 2 + 1 + self.connection_id.len() as u16 + 16
     }
 
     fn write<W: BufMut>(&self, w: &mut W) {
-        match self.address {
-            SocketAddr::V4(ref x) => {
-                w.write::<u8>(4);
-                w.write::<u8>(4);
-                w.put_slice(&x.ip().octets());
-            }
-            SocketAddr::V6(ref x) => {
-                w.write::<u8>(6);
-                w.write::<u8>(16);
-                w.put_slice(&x.ip().octets());
-            }
-        }
-        w.write::<u16>(self.address.port());
+        w.write(self.address_v4.map_or(Ipv4Addr::UNSPECIFIED, |x| *x.ip()));
+        w.write::<u16>(self.address_v4.map_or(0, |x| x.port()));
+        w.write(self.address_v6.map_or(Ipv6Addr::UNSPECIFIED, |x| *x.ip()));
+        w.write::<u16>(self.address_v6.map_or(0, |x| x.port()));
         w.write::<u8>(self.connection_id.len() as u8);
         w.put_slice(&self.connection_id);
         w.put_slice(&self.stateless_reset_token);
     }
 
     fn read<R: Buf>(r: &mut R) -> Result<Self, Error> {
-        if r.remaining() < 2 {
-            return Err(Error::Malformed);
-        }
-        let ip_ver = r.get::<u8>().unwrap();
-        let ip_len = r.get::<u8>().unwrap();
-        if r.remaining() < ip_len as usize {
-            return Err(Error::Malformed);
-        }
-        let ip = match (ip_ver, ip_len) {
-            (4, 4) => {
-                let mut bytes = [0; 4];
-                r.copy_to_slice(&mut bytes);
-                IpAddr::V4(bytes.into())
-            }
-            (6, 16) => {
-                let mut bytes = [0; 16];
-                r.copy_to_slice(&mut bytes);
-                IpAddr::V6(bytes.into())
-            }
-            _ => {
-                return Err(Error::Malformed);
-            }
-        };
-        if r.remaining() < 3 {
-            return Err(Error::Malformed);
-        }
-        let port = r.get::<u16>().unwrap();
-        let cid_len = r.get::<u8>().unwrap();
+        let ip_v4 = r.get::<Ipv4Addr>()?;
+        let port_v4 = r.get::<u16>()?;
+        let ip_v6 = r.get::<Ipv6Addr>()?;
+        let port_v6 = r.get::<u16>()?;
+        let cid_len = r.get::<u8>()?;
         if r.remaining() < cid_len as usize
             || (cid_len != 0 && (cid_len < MIN_CID_SIZE as u8 || cid_len > MAX_CID_SIZE as u8))
         {
@@ -160,8 +127,22 @@ impl PreferredAddress {
         }
         let mut token = [0; RESET_TOKEN_SIZE];
         r.copy_to_slice(&mut token);
+        let address_v4 = if ip_v4.is_unspecified() && port_v4 == 0 {
+            None
+        } else {
+            Some(SocketAddrV4::new(ip_v4, port_v4))
+        };
+        let address_v6 = if ip_v6.is_unspecified() && port_v6 == 0 {
+            None
+        } else {
+            Some(SocketAddrV6::new(ip_v6, port_v6, 0, 0))
+        };
+        if address_v4.is_none() && address_v6.is_none() {
+            return Err(Error::IllegalValue);
+        }
         Ok(Self {
-            address: SocketAddr::new(ip, port),
+            address_v4,
+            address_v6,
             connection_id: cid,
             stateless_reset_token: token,
         })
@@ -181,8 +162,9 @@ pub enum Error {
 impl From<Error> for TransportError {
     fn from(e: Error) -> Self {
         match e {
-            Error::VersionNegotiation => TransportError::VERSION_NEGOTIATION_ERROR,
-            Error::IllegalValue | Error::Malformed => TransportError::TRANSPORT_PARAMETER_ERROR,
+            Error::VersionNegotiation => TransportError::VERSION_NEGOTIATION_ERROR(""),
+            Error::IllegalValue => TransportError::TRANSPORT_PARAMETER_ERROR("illegal value"),
+            Error::Malformed => TransportError::TRANSPORT_PARAMETER_ERROR("malformed"),
         }
     }
 }
@@ -359,6 +341,7 @@ impl TransportParameters {
         }
 
         if params.ack_delay_exponent > 20
+            || params.max_ack_delay >= 1 << 14
             || (side.is_server()
                 && (params.stateless_reset_token.is_some() || params.preferred_address.is_some()))
         {
@@ -383,7 +366,8 @@ mod test {
             ack_delay_exponent: 2,
             max_packet_size: 1200,
             preferred_address: Some(PreferredAddress {
-                address: SocketAddr::new(IpAddr::V4([127, 0, 0, 1].into()), 42),
+                address_v4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42)),
+                address_v6: None,
                 connection_id: ConnectionId::new(&[]),
                 stateless_reset_token: [0xab; RESET_TOKEN_SIZE],
             }),

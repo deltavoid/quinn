@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use err_derive::Error;
@@ -19,13 +19,14 @@ use crate::connection::{
     self, initial_close, ClientConfig, Connection, ConnectionError, TimerUpdate,
 };
 use crate::crypto::{
-    self, reset_token_for, ConnectError, Crypto, HeaderCrypto, TlsSession, TokenKey,
+    self, reset_token_for, Crypto, CryptoClientConfig, CryptoServerConfig, RingHeaderCrypto,
+    TokenKey,
 };
 use crate::packet::{ConnectionId, EcnCodepoint, Header, Packet, PacketDecodeError, PartialDecode};
 use crate::stream::{ReadError, WriteError};
 use crate::transport_parameters::TransportParameters;
 use crate::{
-    Directionality, Side, StreamId, Transmit, TransportError, MAX_CID_SIZE, MIN_CID_SIZE,
+    varint, Directionality, Side, StreamId, Transmit, TransportError, MAX_CID_SIZE, MIN_CID_SIZE,
     MIN_INITIAL_SIZE, RESET_TOKEN_SIZE, VERSION,
 };
 
@@ -43,8 +44,8 @@ pub struct Endpoint {
     connection_ids: FnvHashMap<ConnectionId, ConnectionHandle>,
     connection_remotes: FnvHashMap<SocketAddr, ConnectionHandle>,
     pub(crate) connections: Slab<Connection>,
-    config: Arc<Config>,
-    server_config: Option<ServerConfig>,
+    config: Arc<EndpointConfig>,
+    server_config: Option<Arc<ServerConfig>>,
     /// Connections that might have timer updates to apply perform
     dirty_timers: FnvHashSet<ConnectionHandle>,
     /// Connections that might have packets to send
@@ -57,15 +58,11 @@ pub struct Endpoint {
 impl Endpoint {
     pub fn new(
         log: Logger,
-        config: Config,
-        server_config: Option<ServerConfig>,
-    ) -> Result<Self, EndpointError> {
+        config: Arc<EndpointConfig>,
+        server_config: Option<Arc<ServerConfig>>,
+    ) -> Result<Self, ConfigError> {
+        config.validate()?;
         let rng = OsRng::new().unwrap();
-        let config = Arc::new(config);
-        assert!(
-            (config.local_cid_len == 0 || config.local_cid_len >= MIN_CID_SIZE)
-                && config.local_cid_len <= MAX_CID_SIZE
-        );
         Ok(Self {
             log,
             rng,
@@ -130,20 +127,17 @@ impl Endpoint {
     }
 
     /// Get the next packet to transmit
-    pub fn poll_transmit(&mut self, now: u64) -> Option<Transmit> {
+    pub fn poll_transmit(&mut self, now: Instant) -> Option<Transmit> {
         if let Some(x) = self.transmits.pop_front() {
             return Some(x);
         }
         loop {
             let &ch = self.needs_transmit.iter().next()?;
-            loop {
-                if let Some(transmit) = self.connections[ch].poll_transmit(now) {
-                    self.dirty_timers.insert(ch);
-                    return Some(transmit);
-                } else {
-                    self.needs_transmit.remove(&ch);
-                    break;
-                }
+            if let Some(transmit) = self.connections[ch].poll_transmit(now) {
+                self.dirty_timers.insert(ch);
+                return Some(transmit);
+            } else {
+                self.needs_transmit.remove(&ch);
             }
         }
     }
@@ -151,7 +145,7 @@ impl Endpoint {
     /// Process an incoming UDP datagram
     pub fn handle(
         &mut self,
-        now: u64,
+        now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
         data: BytesMut,
@@ -307,8 +301,9 @@ impl Endpoint {
 
         debug!(
             self.log,
-            "sending stateless reset to {remote}",
-            remote = remote
+            "sending stateless reset for {connection} to {remote}",
+            connection = dst_cid,
+            remote = remote,
         );
         let mut buf = Vec::<u8>::new();
         let padding_len = self.rng.gen_range(MIN_PADDING_LEN, max_padding_len);
@@ -331,17 +326,20 @@ impl Endpoint {
     pub fn connect(
         &mut self,
         remote: SocketAddr,
-        config: &Arc<crypto::ClientConfig>,
+        transport_config: Arc<TransportConfig>,
+        crypto_config: Arc<crypto::ClientConfig>,
         server_name: &str,
     ) -> Result<ConnectionHandle, ConnectError> {
+        transport_config.validate(&self.log)?;
         let remote_id = ConnectionId::random(&mut self.rng, MAX_CID_SIZE);
         trace!(self.log, "initial dcid"; "value" => %remote_id);
         let ch = self.add_connection(
             remote_id,
             remote_id,
             remote,
+            transport_config,
             ConnectionOpts::Client(ClientConfig {
-                tls_config: config.clone(),
+                tls_config: crypto_config,
                 server_name: server_name.into(),
             }),
         )?;
@@ -364,29 +362,30 @@ impl Endpoint {
         initial_id: ConnectionId,
         remote_id: ConnectionId,
         remote: SocketAddr,
+        transport_config: Arc<TransportConfig>,
         opts: ConnectionOpts,
     ) -> Result<ConnectionHandle, ConnectError> {
         let local_id = self.new_cid();
+        let params = TransportParameters::new(&transport_config);
         let (tls, client_config) = match opts {
             ConnectionOpts::Client(config) => (
-                TlsSession::new_client(
-                    &config.tls_config,
-                    &config.server_name,
-                    &TransportParameters::new(&self.config),
-                )?,
+                config
+                    .tls_config
+                    .start_session(&config.server_name, &params)?,
                 Some(config),
             ),
             ConnectionOpts::Server { orig_dst_cid } => {
                 let server_params = TransportParameters {
                     stateless_reset_token: Some(reset_token_for(&self.config.reset_key, &local_id)),
                     original_connection_id: orig_dst_cid,
-                    ..TransportParameters::new(&self.config)
+                    ..params
                 };
                 (
-                    TlsSession::new_server(
-                        &self.server_config.as_ref().unwrap().tls_config,
-                        &server_params,
-                    ),
+                    self.server_config
+                        .as_ref()
+                        .unwrap()
+                        .tls_config
+                        .start_session(&server_params),
                     None,
                 )
             }
@@ -398,6 +397,7 @@ impl Endpoint {
         let id = self.connections.insert(Connection::new(
             self.log.new(o!("connection" => local_id)),
             Arc::clone(&self.config),
+            transport_config,
             initial_id,
             local_id,
             remote_id,
@@ -417,13 +417,13 @@ impl Endpoint {
 
     fn handle_initial(
         &mut self,
-        now: u64,
+        now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
         mut packet: Packet,
         rest: Option<BytesMut>,
         crypto: &Crypto,
-        header_crypto: &HeaderCrypto,
+        header_crypto: &RingHeaderCrypto,
     ) {
         let (src_cid, dst_cid, token, packet_number) = match packet.header {
             Header::Initial {
@@ -450,8 +450,9 @@ impl Endpoint {
 
         // Local CID used for stateless packets
         let temp_loc_cid = ConnectionId::random(&mut self.rng, self.config.local_cid_len);
+        let server_config = self.server_config.as_ref().unwrap();
 
-        if self.incoming_handshakes == self.server_config.as_ref().unwrap().accept_buffer as usize {
+        if self.incoming_handshakes == server_config.accept_buffer as usize {
             debug!(self.log, "rejecting connection due to full accept buffer");
             self.transmits.push_back(Transmit {
                 destination: remote,
@@ -462,15 +463,14 @@ impl Endpoint {
                     &src_cid,
                     &temp_loc_cid,
                     0,
-                    TransportError::SERVER_BUSY,
+                    TransportError::SERVER_BUSY(""),
                 ),
             });
             return;
         }
 
         if dst_cid.len() < 8
-            && (!self.server_config.as_ref().unwrap().use_stateless_retry
-                || dst_cid.len() != self.config.local_cid_len)
+            && (!server_config.use_stateless_retry || dst_cid.len() != self.config.local_cid_len)
         {
             debug!(
                 self.log,
@@ -486,20 +486,16 @@ impl Endpoint {
                     &src_cid,
                     &temp_loc_cid,
                     0,
-                    TransportError::PROTOCOL_VIOLATION,
+                    TransportError::PROTOCOL_VIOLATION("invalid destination CID length"),
                 ),
             });
             return;
         }
 
         let mut retry_cid = None;
-        if self.server_config.as_ref().unwrap().use_stateless_retry {
-            if let Some((token_dst_cid, token_issued)) = self
-                .server_config
-                .as_ref()
-                .unwrap()
-                .token_key
-                .check(&remote, &token)
+        if server_config.use_stateless_retry {
+            if let Some((token_dst_cid, token_issued)) =
+                server_config.token_key.check(&remote, &token)
             {
                 let expires = token_issued
                     + Duration::from_micros(
@@ -514,11 +510,9 @@ impl Endpoint {
                 trace!(self.log, "sending stateless retry due to invalid token");
             }
             if retry_cid.is_none() {
-                let token = self.server_config.as_ref().unwrap().token_key.generate(
-                    &remote,
-                    &dst_cid,
-                    SystemTime::now(),
-                );
+                let token = server_config
+                    .token_key
+                    .generate(&remote, &dst_cid, SystemTime::now());
                 let mut buf = Vec::new();
                 let header = Header::Retry {
                     src_cid: temp_loc_cid,
@@ -543,6 +537,7 @@ impl Endpoint {
                 dst_cid,
                 src_cid,
                 remote,
+                server_config.transport_config.clone(),
                 ConnectionOpts::Server {
                     orig_dst_cid: retry_cid,
                 },
@@ -560,6 +555,7 @@ impl Endpoint {
             rest,
         ) {
             Ok(()) => {
+                trace!(self.log, "connection incoming; ICID {icid}", icid = dst_cid);
                 self.incoming_handshakes += 1;
                 self.needs_transmit.insert(ch);
                 if self.connections[ch].has_1rtt() {
@@ -610,18 +606,19 @@ impl Endpoint {
             .remove(&self.connections[ch].remote());
         self.dirty_timers.remove(&ch);
         self.eventful_conns.remove(&ch);
+        self.needs_transmit.remove(&ch);
         self.connections.remove(ch.0);
     }
 
     /// Handle a timer expiring
-    pub fn timeout(&mut self, now: u64, ch: ConnectionHandle, timer: Timer) {
+    pub fn timeout(&mut self, now: Instant, ch: ConnectionHandle, timer: Timer) {
         if self.connections[ch].timeout(now, timer) {
             self.forget(ch);
             return;
         }
         self.dirty_timers.insert(ch);
         match timer {
-            Timer::LossDetection => {
+            Timer::LossDetection | Timer::KeepAlive => {
                 self.needs_transmit.insert(ch);
             }
             Timer::Idle => {
@@ -748,7 +745,7 @@ impl Endpoint {
     ///
     /// This does not ensure delivery of outstanding data. It is the application's responsibility
     /// to call this only when all important communications have been completed.
-    pub fn close(&mut self, now: u64, ch: ConnectionHandle, error_code: u16, reason: Bytes) {
+    pub fn close(&mut self, now: Instant, ch: ConnectionHandle, error_code: u16, reason: Bytes) {
         if self.connections[ch].is_drained() {
             self.forget(ch);
             return;
@@ -787,11 +784,13 @@ impl Endpoint {
 ///
 /// This should be tuned to suit the application. In particular, window sizes for streams, stream
 /// data, and overall connection data should be set differently depending on the expected round trip
-/// time, link capacity, memory availability, and rate of stream creation. The default configuration
-/// is tuned for a 100Mbps link with a 100ms round trip time, with remote endpoints opening at most
-/// 320 new streams per second. Applications which do not require remotely-initiated streams should
-/// set the stream windows to zero.
-pub struct Config {
+/// time, link capacity, memory availability, and rate of stream creation. Tuning for higher
+/// bandwidths and latencies increases worst-case memory consumption, but does not impair
+/// performance at lower bandwidths and latencies. The default configuration is tuned for a 100Mbps
+/// link with a 100ms round trip time, with remote endpoints opening at most 320 new streams per
+/// second. Applications which do not require remotely-initiated streams should set the stream
+/// windows to zero.
+pub struct TransportConfig {
     /// Maximum number of bidirectional streams that may be initiated by the peer but not yet
     /// accepted locally
     ///
@@ -859,22 +858,17 @@ pub struct Config {
     pub loss_reduction_factor: u16,
     /// Number of consecutive PTOs after which network is considered to be experiencing persistent congestion.
     pub persistent_congestion_threshold: u32,
-
-    /// Length of connection IDs for the endpoint.
+    /// Number of seconds of inactivity before sending a keep-alive packet
     ///
-    /// This must be either 0 or between 4 and 18 inclusive. The length of the local connection IDs
-    /// constrains the amount of simultaneous connections the endpoint can maintain. The API user is
-    /// responsible for making sure that the pool is large enough to cover the intended usage.
-    pub local_cid_len: usize,
-
-    /// Private key used to send authenticated connection resets to peers who were communicating
-    /// with a previous instance of this endpoint.
+    /// Keep-alive packets prevent an inactive but otherwise healthy connection from timing out.
     ///
-    /// Must be persisted across restarts to be useful.
-    pub reset_key: SigningKey,
+    /// 0 to disable, which is the default. Only one side of any given connection needs keep-alive
+    /// enabled for the connection to be preserved. Must be set lower than the idle_timeout of both
+    /// peers to be effective.
+    pub keep_alive_interval: u32,
 }
 
-impl Default for Config {
+impl Default for TransportConfig {
     fn default() -> Self {
         const EXPECTED_RTT: u64 = 100; // ms
         const MAX_STREAM_BANDWIDTH: u64 = 12500 * 1000; // bytes/s
@@ -883,10 +877,7 @@ impl Default for Config {
         const STREAM_RWND: u64 = MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT;
         const MAX_DATAGRAM_SIZE: u64 = 1200;
 
-        let mut reset_value = [0; 64];
-        rand::thread_rng().fill_bytes(&mut reset_value);
-
-        Self {
+        TransportConfig {
             stream_window_bidi: 32,
             stream_window_uni: 32,
             idle_timeout: 10,
@@ -907,15 +898,82 @@ impl Default for Config {
             minimum_window: 2 * MAX_DATAGRAM_SIZE,
             loss_reduction_factor: 0x8000, // 1/2
             persistent_congestion_threshold: 2,
+            keep_alive_interval: 0,
+        }
+    }
+}
 
+impl TransportConfig {
+    fn validate(&self, log: &Logger) -> Result<(), ConfigError> {
+        if let Some((name, _)) = [
+            ("stream_window_bidi", self.stream_window_bidi),
+            ("stream_window_uni", self.stream_window_uni),
+            ("receive_window", self.receive_window),
+            ("stream_receive_window", self.stream_receive_window),
+            ("idle_timeout", self.idle_timeout),
+        ]
+        .iter()
+        .find(|&&(_, x)| x > varint::MAX_VALUE)
+        {
+            return Err(ConfigError::VarIntBounds(name));
+        }
+        if self.keep_alive_interval as u64 >= self.idle_timeout {
+            warn!(
+                log,
+                "keep-alive interval {} is ineffective due to lower idle timeout {}",
+                self.keep_alive_interval,
+                self.idle_timeout
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Global configuration for the endpoint, affecting all connections
+pub struct EndpointConfig {
+    /// Length of connection IDs for the endpoint.
+    ///
+    /// This must be either 0 or between 4 and 18 inclusive. The length of the local connection IDs
+    /// constrains the amount of simultaneous connections the endpoint can maintain. The API user is
+    /// responsible for making sure that the pool is large enough to cover the intended usage.
+    pub local_cid_len: usize,
+
+    /// Private key used to send authenticated connection resets to peers who were communicating
+    /// with a previous instance of this endpoint.
+    ///
+    /// Must be persisted across restarts to be useful.
+    pub reset_key: SigningKey,
+}
+
+impl Default for EndpointConfig {
+    fn default() -> Self {
+        let mut reset_value = [0; 64];
+        rand::thread_rng().fill_bytes(&mut reset_value);
+        Self {
             local_cid_len: 8,
             reset_key: SigningKey::new(&digest::SHA512_256, &reset_value),
         }
     }
 }
 
+impl EndpointConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if (self.local_cid_len != 0 && self.local_cid_len < MIN_CID_SIZE)
+            || self.local_cid_len > MAX_CID_SIZE
+        {
+            return Err(ConfigError::IllegalValue(
+                "local_cid_len must be 0 or in [4, 18]",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Parameters governing incoming connections.
 pub struct ServerConfig {
+    /// Transport configuration to use for incoming connections
+    pub transport_config: Arc<TransportConfig>,
+
     /// TLS configuration used for incoming connections.
     ///
     /// Must be set to use TLS 1.3 only.
@@ -932,8 +990,7 @@ pub struct ServerConfig {
 
     /// Maximum number of incoming connections to buffer.
     ///
-    /// Calling `Endpoint::accept` removes a connection from the buffer, so this does not need to
-    /// be large.
+    /// Accepting a connection removes it from the buffer, so this does not need to be large.
     pub accept_buffer: u32,
 }
 
@@ -945,6 +1002,7 @@ impl Default for ServerConfig {
         rng.fill_bytes(&mut token_value);
 
         Self {
+            transport_config: Arc::new(TransportConfig::default()),
             tls_config: Arc::new(crypto::build_server_config()),
 
             token_key: TokenKey::new(&token_value),
@@ -958,15 +1016,14 @@ impl Default for ServerConfig {
 
 /// Errors in the configuration of an endpoint
 #[derive(Debug, Error)]
-pub enum EndpointError {
-    #[error(display = "failed to configure TLS: {}", _0)]
-    Tls(crypto::TLSError),
-}
-
-impl From<crypto::TLSError> for EndpointError {
-    fn from(x: crypto::TLSError) -> Self {
-        EndpointError::Tls(x)
-    }
+pub enum ConfigError {
+    /// The supplied configuration contained an invalid value
+    #[error(display = "illegal configuration value: {}", _0)]
+    IllegalValue(&'static str),
+    /// A configuration field that will be encoded as a variable-length integer exceeds the 0..2^62
+    /// range
+    #[error(display = "{} must be at most 2^62-1", _0)]
+    VarIntBounds(&'static str),
 }
 
 /// Events of interest to the application
@@ -1006,15 +1063,19 @@ pub enum Timer {
     Close = 2,
     KeyDiscard = 3,
     PathValidation = 4,
+    KeepAlive = 5,
 }
 
 impl Timer {
-    pub(crate) const VALUES: [Timer; 5] = [
+    /// Number of types of timers that a connection may start
+    pub const COUNT: usize = 6;
+    pub(crate) const VALUES: [Timer; Self::COUNT] = [
         Timer::LossDetection,
         Timer::Idle,
         Timer::Close,
         Timer::KeyDiscard,
         Timer::PathValidation,
+        Timer::KeepAlive,
     ];
 }
 
@@ -1054,4 +1115,32 @@ impl IndexMut<ConnectionHandle> for Slab<Connection> {
 enum ConnectionOpts {
     Client(ClientConfig),
     Server { orig_dst_cid: Option<ConnectionId> },
+}
+
+/// Errors in the parameters being used to create a new connection
+///
+/// These arise before any I/O has been performed.
+#[derive(Debug, Error)]
+pub enum ConnectError {
+    /// The domain name supplied was malformed
+    #[error(display = "invalid DNS name: {}", _0)]
+    InvalidDnsName(String),
+    /// The TLS configuration was invalid
+    #[error(display = "TLS error: {}", _0)]
+    Tls(crypto::TLSError),
+    /// The transport configuration was invalid
+    #[error(display = "transport configuration error: {}", _0)]
+    Config(ConfigError),
+}
+
+impl From<crypto::TLSError> for ConnectError {
+    fn from(x: crypto::TLSError) -> Self {
+        ConnectError::Tls(x)
+    }
+}
+
+impl From<ConfigError> for ConnectError {
+    fn from(x: ConfigError) -> Self {
+        ConnectError::Config(x)
+    }
 }

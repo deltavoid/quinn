@@ -6,7 +6,6 @@ use std::net::ToSocketAddrs;
 use std::rc::Rc;
 use std::str;
 use std::sync::Arc;
-use std::time::Instant;
 
 use err_derive::Error;
 use fnv::FnvHashMap;
@@ -15,7 +14,7 @@ use quinn_proto as quinn;
 use rustls::{KeyLogFile, ProtocolVersion, TLSError};
 use slog::Logger;
 
-use quinn_proto::{Config, ServerConfig};
+use quinn_proto::{EndpointConfig, ServerConfig, TransportConfig};
 
 use crate::tls::{Certificate, CertificateChain, PrivateKey};
 use crate::udp::UdpSocket;
@@ -26,14 +25,14 @@ pub struct EndpointBuilder<'a> {
     reactor: Option<&'a tokio_reactor::Handle>,
     logger: Logger,
     server_config: Option<ServerConfig>,
-    config: Config,
+    config: EndpointConfig,
     client_config: ClientConfig,
 }
 
 #[allow(missing_docs)]
 impl<'a> EndpointBuilder<'a> {
     /// Start a builder with a specific initial low-level configuration.
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: EndpointConfig) -> Self {
         Self {
             config,
             ..Self::default()
@@ -65,9 +64,12 @@ impl<'a> EndpointBuilder<'a> {
         let rc = Rc::new(RefCell::new(EndpointInner {
             log: self.logger.clone(),
             socket,
-            inner: quinn::Endpoint::new(self.logger, self.config, self.server_config)?,
+            inner: quinn::Endpoint::new(
+                self.logger,
+                Arc::new(self.config),
+                self.server_config.map(Arc::new),
+            )?,
             outgoing: None,
-            epoch: Instant::now(),
             pending: FnvHashMap::default(),
             timers: FuturesUnordered::new(),
             buffered_incoming: VecDeque::new(),
@@ -115,7 +117,7 @@ impl<'a> Default for EndpointBuilder<'a> {
             reactor: None,
             logger: Logger::root(slog::Discard, o!()),
             server_config: None,
-            config: Config::default(),
+            config: EndpointConfig::default(),
             client_config: ClientConfig::default(),
         }
     }
@@ -133,14 +135,14 @@ pub enum EndpointError {
     /// Errors relating to web PKI infrastructure
     #[error(display = "webpki failed: {:?}", _0)]
     WebPki(webpki::Error),
+    /// An error in the Quinn transport configuration
+    #[error(display = "configuration error: {:?}", _0)]
+    Config(quinn::ConfigError),
 }
 
-impl From<quinn::EndpointError> for EndpointError {
-    fn from(x: quinn::EndpointError) -> Self {
-        use crate::quinn::EndpointError::*;
-        match x {
-            Tls(x) => EndpointError::Tls(x),
-        }
+impl From<quinn::ConfigError> for EndpointError {
+    fn from(x: quinn::ConfigError) -> Self {
+        EndpointError::Config(x)
     }
 }
 
@@ -171,39 +173,30 @@ impl ServerConfigBuilder {
     ///
     /// Useful for debugging encrypted communications with protocol analyzers such as Wireshark.
     pub fn enable_keylog(&mut self) -> &mut Self {
-        {
-            let tls_server_config = Arc::get_mut(&mut self.config.tls_config).unwrap();
-            tls_server_config.key_log = Arc::new(KeyLogFile::new());
-        }
+        Arc::make_mut(&mut self.config.tls_config).key_log = Arc::new(KeyLogFile::new());
         self
     }
 
     /// Set the certificate chain that will be presented to clients.
-    pub fn set_certificate(
+    pub fn certificate(
         &mut self,
         cert_chain: CertificateChain,
         key: PrivateKey,
     ) -> Result<&mut Self, TLSError> {
-        {
-            let tls_server_config = Arc::get_mut(&mut self.config.tls_config).unwrap();
-            tls_server_config.set_single_cert(cert_chain.certs, key.inner)?;
-        }
+        Arc::make_mut(&mut self.config.tls_config).set_single_cert(cert_chain.certs, key.inner)?;
         Ok(self)
     }
 
-    /// Set the application-layer protocols to accept.
+    /// Set the application-layer protocols to accept, in order of descending preference.
     ///
     /// When set, clients which don't declare support for at least one of the supplied protocols will be rejected.
-    // TODO: Cite IANA registery for ALPN IDs
-    pub fn set_protocols(&mut self, protocols: &[&[u8]]) -> &mut Self {
-        {
-            let tls_server_config = Arc::get_mut(&mut self.config.tls_config).unwrap();
-            let protocols_strings = protocols
-                .iter()
-                .map(|p| str::from_utf8(p).unwrap().into())
-                .collect::<Vec<_>>();
-            tls_server_config.set_protocols(&protocols_strings);
-        }
+    ///
+    /// The IANA maintains a [registry] of standard protocol IDs, but custom IDs may be used as well.
+    ///
+    /// [registry]: https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml#alpn-protocol-ids
+    pub fn protocols(&mut self, protocols: &[&[u8]]) -> &mut Self {
+        Arc::make_mut(&mut self.config.tls_config).alpn_protocols =
+            protocols.iter().map(|x| x.to_vec()).collect();
         self
     }
 
@@ -224,20 +217,24 @@ impl Default for ServerConfigBuilder {
 
 /// Helper for creating new outgoing connections.
 pub struct ClientConfigBuilder {
-    config: quinn::ClientConfig,
+    transport: TransportConfig,
+    crypto: quinn::ClientConfig,
 }
 
 impl ClientConfigBuilder {
     /// Create a new builder with default options set.
     pub fn new() -> Self {
-        let mut config = quinn::ClientConfig::new();
-        config
+        let mut crypto = quinn::ClientConfig::new();
+        crypto
             .root_store
             .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-        config.ct_logs = Some(&ct_logs::LOGS);
-        config.versions = vec![ProtocolVersion::TLSv1_3];
-        config.enable_early_data = true;
-        Self { config }
+        crypto.ct_logs = Some(&ct_logs::LOGS);
+        crypto.versions = vec![ProtocolVersion::TLSv1_3];
+        crypto.enable_early_data = true;
+        Self {
+            transport: TransportConfig::default(),
+            crypto,
+        }
     }
 
     /// Add a trusted certificate authority.
@@ -253,7 +250,7 @@ impl ClientConfigBuilder {
             let anchor = webpki::trust_anchor_util::cert_der_as_trust_anchor(
                 untrusted::Input::from(&cert.inner.0),
             )?;
-            self.config
+            self.crypto
                 .root_store
                 .add_server_trust_anchors(&webpki::TLSServerTrustAnchors(&[anchor]));
         }
@@ -264,27 +261,27 @@ impl ClientConfigBuilder {
     ///
     /// Useful for debugging encrypted communications with protocol analyzers such as Wireshark.
     pub fn enable_keylog(&mut self) -> &mut Self {
-        self.config.key_log = Arc::new(KeyLogFile::new());
+        self.crypto.key_log = Arc::new(KeyLogFile::new());
         self
     }
 
-    /// Set application-layer protocols to declare support for.
-    pub fn set_protocols(&mut self, protocols: &[&[u8]]) -> &mut Self {
-        self.config.alpn_protocols = protocols
-            .iter()
-            .map(|p| {
-                str::from_utf8(p)
-                    .expect("non-UTF8 protocols unsupported")
-                    .into()
-            })
-            .collect();
+    /// Set the application-layer protocols to accept, in order of descending preference.
+    ///
+    /// When set, clients which don't declare support for at least one of the supplied protocols will be rejected.
+    ///
+    /// The IANA maintains a [registry] of standard protocol IDs, but custom IDs may be used as well.
+    ///
+    /// [registry]: https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml#alpn-protocol-ids
+    pub fn protocols(&mut self, protocols: &[&[u8]]) -> &mut Self {
+        self.crypto.alpn_protocols = protocols.iter().map(|x| x.to_vec()).collect();
         self
     }
 
     /// Begin connecting from `endpoint` to `addr`.
     pub fn build(self) -> ClientConfig {
         ClientConfig {
-            tls_config: Arc::new(self.config),
+            transport: Arc::new(self.transport),
+            tls_config: Arc::new(self.crypto),
         }
     }
 }
@@ -298,6 +295,9 @@ impl Default for ClientConfigBuilder {
 /// Configuration for outgoing connections
 #[derive(Clone)]
 pub struct ClientConfig {
+    /// Transport configuration to use
+    pub transport: Arc<TransportConfig>,
+
     /// TLS configuration to use.
     ///
     /// `versions` *must* be `vec![ProtocolVersion::TLSv1_3]`.

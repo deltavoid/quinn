@@ -6,7 +6,7 @@ use rand::Rng;
 use slog;
 
 use crate::coding::{self, BufExt, BufMutExt};
-use crate::crypto::HeaderCrypto;
+use crate::crypto::{HeaderCrypto, RingHeaderCrypto};
 use crate::varint;
 use crate::{MAX_CID_SIZE, MIN_CID_SIZE, VERSION};
 
@@ -96,7 +96,10 @@ impl PartialDecode {
         self.buf.get_ref().len()
     }
 
-    pub fn finish(self, header_crypto: Option<&HeaderCrypto>) -> Result<Packet, PacketDecodeError> {
+    pub fn finish(
+        self,
+        header_crypto: Option<&RingHeaderCrypto>,
+    ) -> Result<Packet, PacketDecodeError> {
         use self::PlainHeader::*;
         let Self {
             plain_header,
@@ -182,7 +185,7 @@ impl PartialDecode {
 
     fn decrypt_header(
         buf: &mut io::Cursor<BytesMut>,
-        header_crypto: &HeaderCrypto,
+        header_crypto: &RingHeaderCrypto,
     ) -> Result<PacketNumber, PacketDecodeError> {
         let packet_length = buf.get_ref().len();
         let pn_offset = buf.position() as usize;
@@ -394,6 +397,17 @@ impl Header {
             _ => false,
         }
     }
+
+    pub fn dst_cid(&self) -> &ConnectionId {
+        use self::Header::*;
+        match *self {
+            Initial { ref dst_cid, .. } => dst_cid,
+            Long { ref dst_cid, .. } => dst_cid,
+            Retry { ref dst_cid, .. } => dst_cid,
+            Short { ref dst_cid, .. } => dst_cid,
+            VersionNegotiate { ref dst_cid, .. } => dst_cid,
+        }
+    }
 }
 
 pub struct PartialEncode {
@@ -401,7 +415,7 @@ pub struct PartialEncode {
 }
 
 impl PartialEncode {
-    pub fn finish(self, buf: &mut [u8], header_crypto: &HeaderCrypto) {
+    pub fn finish(self, buf: &mut [u8], header_crypto: &RingHeaderCrypto) {
         let PartialEncode { pn, .. } = self;
         let pn_pos = if let Some(pn) = pn {
             pn
@@ -952,7 +966,7 @@ mod tests {
         set_payload_length(&mut buf, header_len, 1, client_crypto.tag_len());
         assert_eq!(
             buf[..],
-            hex!("c0ff0000115006b858ec6f80452b00402100 00000000000000000000000000000000")[..]
+            hex!("c0ff0000125006b858ec6f80452b00402100 00000000000000000000000000000000")[..]
         );
 
         client_crypto.encrypt(0, &mut buf, header_len);
@@ -960,8 +974,8 @@ mod tests {
         assert_eq!(
             buf[..],
             hex!(
-                "c8ff0000115006b858ec6f80452b004021a7
-                 f037a410591e943c31d1eefad0927b97e620160d59c776720c7118b9699a15b3"
+                "ceff0000125006b858ec6f80452b004021b6
+                 f037a410591e943c31d1eefad0927b97cbc32ece77d2881aa8f1b0c51ec425b0"
             )[..]
         );
 
@@ -971,7 +985,7 @@ mod tests {
         let mut packet = decode.finish(Some(&server_header_crypto)).unwrap();
         assert_eq!(
             packet.header_data[..],
-            hex!("c0ff0000115006b858ec6f80452b00402100")[..]
+            hex!("c0ff0000125006b858ec6f80452b00402100")[..]
         );
         server_crypto
             .decrypt(0, &packet.header_data, &mut packet.payload)

@@ -13,20 +13,21 @@ extern crate slog;
 use std::fmt;
 use std::net::SocketAddr;
 use std::ops;
+use std::time::Duration;
 
-mod coding;
+pub mod coding;
 mod dedup;
 mod range_set;
 #[cfg(test)]
 mod tests;
 mod transport_parameters;
-mod varint;
+pub mod varint;
 
 mod connection;
 pub use crate::connection::{ConnectionError, TimerSetting, TimerUpdate};
 
 mod crypto;
-pub use crate::crypto::{ClientConfig, ConnectError, TokenKey};
+pub use crate::crypto::{ClientConfig, TokenKey};
 
 mod frame;
 use crate::frame::Frame;
@@ -34,7 +35,8 @@ pub use crate::frame::{ApplicationClose, ConnectionClose};
 
 mod endpoint;
 pub use crate::endpoint::{
-    Config, ConnectionHandle, Endpoint, EndpointError, Event, ServerConfig, Timer,
+    ConfigError, ConnectError, ConnectionHandle, Endpoint, EndpointConfig, Event, ServerConfig,
+    Timer, TransportConfig,
 };
 
 mod packet;
@@ -44,13 +46,16 @@ mod stream;
 pub use crate::stream::{ReadError, WriteError};
 
 mod transport_error;
-pub use crate::transport_error::Error as TransportError;
+pub use crate::transport_error::{Code as TransportErrorCode, Error as TransportError};
 
 /// The QUIC protocol version implemented
-pub const VERSION: u32 = 0xff00_0011;
+pub const VERSION: u32 = 0xff00_0012;
 
 /// TLS ALPN value for HTTP over QUIC
-pub const ALPN_QUIC_HTTP: &[u8] = b"hq-17";
+pub const ALPN_QUIC_HTTP: &[u8] = b"hq-18";
+
+/// TLS ALPN value for H3
+pub const ALPN_QUIC_H3: &[u8] = b"h3-18";
 
 /// Whether an endpoint was the initiator of a connection
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -212,4 +217,4 @@ const MAX_CID_SIZE: usize = 18;
 const MIN_CID_SIZE: usize = 4;
 const MIN_INITIAL_SIZE: usize = 1200;
 const MIN_MTU: u16 = 1232;
-const TIMER_GRANULARITY: u64 = 1000;
+const TIMER_GRANULARITY: Duration = Duration::from_millis(1);

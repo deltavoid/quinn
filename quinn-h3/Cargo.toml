@@ -1,0 +1,35 @@
+[package]
+name = "quinn-h3"
+version = "0.0.1"
+authors = [
+    "Benjamin Saunders <ben.e.saunders@gmail.com>", "Dirkjan Ochtman <dirkjan@ochtman.nl>",
+    "Jean-Christophe BEGUE <begue.jc@gmail.com>"
+]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/djc/quinn"
+description = "QUIC HTTP/3 protocol implementation"
+readme = "../README.md"
+keywords = ["quic", "http3", "qpack"]
+categories = [ "network-programming", "asynchronous" ]
+workspace = ".."
+edition = "2018"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[badges]
+codecov = { repository = "djc/quinn" }
+maintenance = { status = "experimental" }
+travis-ci = { repository = "djc/quinn" }
+
+[dependencies]
+quinn-proto = { path = "../quinn-proto", version = "0.2.0" }
+quinn = { path = "../quinn", version = "0.2.0" }
+bytes = "0.4.7"
+bitlab = "0.8.1"
+lazy_static = "1"
+err-derive = "0.1.5"
+
+[dev-dependencies]
+proptest = "0.9.1"
+assert_matches = "1.1"

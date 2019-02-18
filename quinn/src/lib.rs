@@ -65,7 +65,7 @@ use std::net::{SocketAddr, SocketAddrV6};
 use std::rc::Rc;
 use std::str;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{io, mem};
 
 use bytes::Bytes;
@@ -82,7 +82,8 @@ use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_timer::Delay;
 
 pub use crate::quinn::{
-    Config, ConnectError, ConnectionError, ConnectionId, ServerConfig, ALPN_QUIC_HTTP,
+    ConnectError, ConnectionError, ConnectionId, ServerConfig, TransportConfig, ALPN_QUIC_H3,
+    ALPN_QUIC_HTTP,
 };
 pub use crate::tls::{Certificate, CertificateChain, PrivateKey};
 
@@ -136,7 +137,12 @@ impl Endpoint {
         server_name: &str,
     ) -> Result<impl Future<Item = NewClientConnection, Error = ConnectionError>, ConnectError>
     {
-        let (fut, conn) = self.connect_inner(addr, &config.tls_config, server_name)?;
+        let (fut, conn) = self.connect_inner(
+            addr,
+            config.transport.clone(),
+            config.tls_config.clone(),
+            server_name,
+        )?;
         Ok(fut.map_err(|_| unreachable!()).and_then(move |err| {
             if let Some(err) = err {
                 Err(err)
@@ -144,6 +150,25 @@ impl Endpoint {
                 Ok(NewClientConnection::new(Rc::new(conn)))
             }
         }))
+    }
+
+    /// Switch to a new UDP socket
+    ///
+    /// Allows the endpoint's address to be updated live, affecting all active connections. Incoming
+    /// connections and connections to servers unreachable from the new address will be lost.
+    ///
+    /// On error, the old UDP socket is retained.
+    pub fn rebind(
+        &self,
+        socket: std::net::UdpSocket,
+        reactor: &tokio_reactor::Handle,
+    ) -> io::Result<()> {
+        let addr = socket.local_addr()?;
+        let socket = UdpSocket::from_std(socket, &reactor)?;
+        let mut inner = self.inner.borrow_mut();
+        inner.socket = socket;
+        inner.ipv6 = addr.is_ipv6();
+        Ok(())
     }
 
     /*
@@ -190,7 +215,8 @@ impl Endpoint {
     fn connect_inner(
         &self,
         addr: &SocketAddr,
-        config: &Arc<quinn::ClientConfig>,
+        transport_config: Arc<TransportConfig>,
+        crypto_config: Arc<quinn::ClientConfig>,
         server_name: &str,
     ) -> Result<
         (
@@ -207,7 +233,10 @@ impl Endpoint {
             } else {
                 *addr
             };
-            let handle = endpoint.inner.connect(addr, config, server_name)?;
+            let handle =
+                endpoint
+                    .inner
+                    .connect(addr, transport_config, crypto_config, server_name)?;
             endpoint.pending.insert(handle, Pending::new(Some(send)));
             endpoint.notify();
             handle
@@ -233,7 +262,7 @@ impl Future for Driver {
         if endpoint.driver.is_none() {
             endpoint.driver = Some(task::current());
         }
-        let now = micros_from(endpoint.epoch.elapsed());
+        let now = Instant::now();
         loop {
             loop {
                 match endpoint.socket.poll_recv(&mut buf) {
@@ -416,11 +445,10 @@ impl Future for Driver {
                         timer: timer @ quinn::Timer::Close,
                         update: quinn::TimerSetting::Start(time),
                     } => {
-                        let instant = endpoint.epoch + duration_micros(time);
                         endpoint.timers.push(Timer {
                             ch,
                             ty: timer,
-                            delay: Delay::new(instant),
+                            delay: Delay::new(time),
                             cancel: None,
                         });
                     }
@@ -430,17 +458,16 @@ impl Future for Driver {
                     } => {
                         let pending = endpoint.pending.get_mut(&ch).unwrap();
                         let cancel = &mut pending.cancel_timers[timer as usize];
-                        let instant = endpoint.epoch + duration_micros(time);
                         if let Some(cancel) = cancel.take() {
                             let _ = cancel.send(());
                         }
                         let (send, recv) = oneshot::channel();
                         *cancel = Some(send);
-                        trace!(endpoint.log, "timer start"; "timer" => ?timer, "time" => ?duration_micros(time));
+                        trace!(endpoint.log, "timer start"; "timer" => ?timer, "time" => ?time);
                         endpoint.timers.push(Timer {
                             ch,
                             ty: timer,
-                            delay: Delay::new(instant),
+                            delay: Delay::new(time),
                             cancel: Some(recv),
                         });
                     }
@@ -470,9 +497,11 @@ impl Drop for Driver {
     fn drop(&mut self) {
         let mut endpoint = self.0.borrow_mut();
         for ch in endpoint.pending.values_mut() {
-            ch.fail(ConnectionError::TransportError {
-                error_code: quinn::TransportError::INTERNAL_ERROR,
-            });
+            ch.fail(ConnectionError::TransportError(quinn::TransportError {
+                code: quinn::TransportErrorCode::INTERNAL_ERROR,
+                frame: None,
+                reason: "driver future was dropped".to_string(),
+            }));
         }
     }
 }
@@ -482,7 +511,6 @@ struct EndpointInner {
     socket: UdpSocket,
     inner: quinn::Endpoint,
     outgoing: Option<quinn::Transmit>,
-    epoch: Instant,
     pending: FnvHashMap<ConnectionHandle, Pending>,
     // TODO: Replace this with something custom that avoids using oneshots to cancel
     timers: FuturesUnordered<Timer>,
@@ -507,7 +535,7 @@ struct Pending {
     connecting: Option<oneshot::Sender<Option<ConnectionError>>>,
     uni_opening: VecDeque<oneshot::Sender<Result<StreamId, ConnectionError>>>,
     bi_opening: VecDeque<oneshot::Sender<Result<StreamId, ConnectionError>>>,
-    cancel_timers: [Option<oneshot::Sender<()>>; 5],
+    cancel_timers: [Option<oneshot::Sender<()>>; quinn::Timer::COUNT],
     incoming_streams_reader: Option<Task>,
     finishing: FnvHashMap<StreamId, oneshot::Sender<Option<ConnectionError>>>,
     error: Option<ConnectionError>,
@@ -524,7 +552,7 @@ impl Pending {
             connecting,
             uni_opening: VecDeque::new(),
             bi_opening: VecDeque::new(),
-            cancel_timers: [None, None, None, None, None],
+            cancel_timers: [None, None, None, None, None, None],
             incoming_streams_reader: None,
             finishing: FnvHashMap::default(),
             error: None,
@@ -677,12 +705,9 @@ impl Connection {
             );
             pending.closing = Some(send);
 
-            endpoint.inner.close(
-                micros_from(endpoint.epoch.elapsed()),
-                self.0.handle,
-                error_code,
-                reason.into(),
-            );
+            endpoint
+                .inner
+                .close(Instant::now(), self.0.handle, error_code, reason.into());
         }
         let handle = self.clone();
         recv.then(move |_| {
@@ -762,12 +787,9 @@ impl Drop for ConnectionInner {
             }
             pending.get_mut().dropped = true;
             if pending.get().closing.is_none() {
-                endpoint.inner.close(
-                    micros_from(endpoint.epoch.elapsed()),
-                    self.handle,
-                    0,
-                    (&[][..]).into(),
-                );
+                endpoint
+                    .inner
+                    .close(Instant::now(), self.handle, 0, (&[][..]).into());
                 if let Some(x) = endpoint.driver.as_ref() {
                     x.notify();
                 }
@@ -1258,12 +1280,4 @@ fn ensure_ipv6(x: SocketAddr) -> SocketAddrV6 {
         SocketAddr::V6(x) => x,
         SocketAddr::V4(x) => SocketAddrV6::new(x.ip().to_ipv6_mapped(), x.port(), 0, 0),
     }
-}
-
-fn duration_micros(x: u64) -> Duration {
-    Duration::new(x / (1000 * 1000), (x % (1000 * 1000)) as u32 * 1000)
-}
-
-fn micros_from(x: Duration) -> u64 {
-    x.as_secs() * 1000 * 1000 + x.subsec_micros() as u64
 }

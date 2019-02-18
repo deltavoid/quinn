@@ -3,8 +3,8 @@ use std::io::{self, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::ops::RangeFrom;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use std::{env, fmt, mem, str};
+use std::time::{Duration, Instant};
+use std::{cmp, env, fmt, mem, str};
 
 use byteorder::{BigEndian, ByteOrder};
 use bytes::Bytes;
@@ -65,9 +65,9 @@ struct Pair {
     log: Logger,
     server: TestEndpoint,
     client: TestEndpoint,
-    time: u64,
+    time: Instant,
     // One-way
-    latency: u64,
+    latency: Duration,
     /// Number of spin bit flips
     spins: u64,
     last_spin: bool,
@@ -75,7 +75,7 @@ struct Pair {
 
 impl Default for Pair {
     fn default() -> Self {
-        Pair::new(Default::default(), Default::default(), server_config())
+        Pair::new(Default::default(), server_config())
     }
 }
 
@@ -112,15 +112,15 @@ fn client_config() -> Arc<ClientConfig> {
 }
 
 impl Pair {
-    fn new(server_config: Config, client_config: Config, listen_keys: ServerConfig) -> Self {
+    fn new(endpoint_config: Arc<EndpointConfig>, server_config: ServerConfig) -> Self {
         let log = logger();
         let server = Endpoint::new(
             log.new(o!("side" => "Server")),
-            server_config,
-            Some(listen_keys),
+            endpoint_config.clone(),
+            Some(Arc::new(server_config)),
         )
         .unwrap();
-        let client = Endpoint::new(log.new(o!("side" => "Client")), client_config, None).unwrap();
+        let client = Endpoint::new(log.new(o!("side" => "Client")), endpoint_config, None).unwrap();
 
         let server_addr = SocketAddr::new(
             Ipv6Addr::LOCALHOST.into(),
@@ -134,8 +134,8 @@ impl Pair {
             log,
             server: TestEndpoint::new(Side::Server, server, server_addr),
             client: TestEndpoint::new(Side::Client, client, client_addr),
-            time: 0,
-            latency: 0,
+            time: Instant::now(),
+            latency: Duration::new(0, 0),
             spins: 0,
             last_spin: false,
         }
@@ -145,33 +145,30 @@ impl Pair {
     fn step(&mut self) -> bool {
         self.drive_client();
         self.drive_server();
-        let client_t = self.client.next_wakeup();
-        let server_t = self.server.next_wakeup();
-        if client_t == self.client.timers[Timer::Idle as usize]
-            && server_t == self.server.timers[Timer::Idle as usize]
-        {
+        if self.client.is_idle() && self.server.is_idle() {
             return false;
         }
-        if client_t < server_t {
-            if client_t != self.time {
-                self.time = self.time.max(client_t);
-                trace!(
-                    self.log,
-                    "advancing to {:?} for client",
-                    Duration::from_micros(self.time)
-                );
+
+        let client_t = self.client.next_wakeup();
+        let server_t = self.server.next_wakeup();
+        match min_opt(client_t, server_t) {
+            Some(t) if Some(t) == client_t => {
+                if t != self.time {
+                    self.time = self.time.max(t);
+                    trace!(self.log, "advancing to {:?} for client", self.time);
+                }
+                true
             }
-        } else {
-            if server_t != self.time {
-                self.time = self.time.max(server_t);
-                trace!(
-                    self.log,
-                    "advancing to {:?} for server",
-                    Duration::from_micros(self.time)
-                );
+            Some(t) if Some(t) == server_t => {
+                if t != self.time {
+                    self.time = self.time.max(t);
+                    trace!(self.log, "advancing to {:?} for server", self.time);
+                }
+                true
             }
+            Some(_) => unreachable!(),
+            None => false,
         }
-        true
     }
 
     /// Advance time until both connections are idle
@@ -218,7 +215,12 @@ impl Pair {
         info!(self.log, "connecting");
         let client_ch = self
             .client
-            .connect(self.server.addr, &client_config(), "localhost")
+            .connect(
+                self.server.addr,
+                Default::default(),
+                client_config(),
+                "localhost",
+            )
             .unwrap();
         self.drive();
         let server_ch = self.server.assert_accept();
@@ -233,11 +235,11 @@ struct TestEndpoint {
     endpoint: Endpoint,
     addr: SocketAddr,
     socket: Option<UdpSocket>,
-    timers: [u64; 5],
+    timers: [Option<Instant>; Timer::COUNT],
     conn: Option<ConnectionHandle>,
     outbound: VecDeque<Transmit>,
     delayed: VecDeque<Transmit>,
-    inbound: VecDeque<(u64, Option<EcnCodepoint>, Box<[u8]>)>,
+    inbound: VecDeque<(Instant, Option<EcnCodepoint>, Box<[u8]>)>,
 }
 
 impl TestEndpoint {
@@ -256,7 +258,7 @@ impl TestEndpoint {
             endpoint,
             addr,
             socket,
-            timers: [u64::max_value(); 5],
+            timers: [None; Timer::COUNT],
             conn: None,
             outbound: VecDeque::new(),
             delayed: VecDeque::new(),
@@ -264,7 +266,7 @@ impl TestEndpoint {
         }
     }
 
-    fn drive(&mut self, log: &Logger, now: u64, remote: SocketAddr) {
+    fn drive(&mut self, log: &Logger, now: Instant, remote: SocketAddr) {
         if let Some(ref socket) = self.socket {
             loop {
                 let mut buf = [0; 8192];
@@ -275,15 +277,17 @@ impl TestEndpoint {
         }
         if let Some(conn) = self.conn {
             for &timer in Timer::VALUES.iter() {
-                if self.timers[timer as usize] <= now {
-                    trace!(
-                        log,
-                        "{side:?} {timer:?} timeout",
-                        side = self.side,
-                        timer = timer
-                    );
-                    self.timers[timer as usize] = u64::max_value();
-                    self.endpoint.timeout(now, conn, timer);
+                if let Some(time) = self.timers[timer as usize] {
+                    if time <= now {
+                        trace!(
+                            log,
+                            "{side:?} {timer:?} timeout",
+                            side = self.side,
+                            timer = timer
+                        );
+                        self.timers[timer as usize] = None;
+                        self.endpoint.timeout(now, conn, timer);
+                    }
                 }
             }
         }
@@ -297,7 +301,7 @@ impl TestEndpoint {
         }
         while let Some((ch, x)) = self.endpoint.poll_timers() {
             self.conn = Some(ch);
-            let time = match x.update {
+            self.timers[x.timer as usize] = match x.update {
                 TimerSetting::Stop => {
                     trace!(
                         log,
@@ -305,30 +309,31 @@ impl TestEndpoint {
                         side = self.side,
                         timer = x.timer
                     );
-                    u64::max_value()
+                    None
                 }
                 TimerSetting::Start(time) => {
                     trace!(
                         log,
                         "{side:?} {timer:?} set to expire at {:?}",
-                        Duration::from_micros(time),
+                        time,
                         side = self.side,
                         timer = x.timer,
                     );
-                    time
+                    Some(time)
                 }
             };
-            self.timers[x.timer as usize] = time;
         }
     }
 
-    fn next_wakeup(&self) -> u64 {
-        self.timers
-            .iter()
-            .cloned()
-            .min()
-            .unwrap()
-            .min(self.inbound.front().map_or(u64::max_value(), |x| x.0))
+    fn next_wakeup(&self) -> Option<Instant> {
+        let next_timer = self.timers.iter().cloned().filter_map(|t| t).min();
+        let next_inbound = self.inbound.front().map(|x| x.0);
+        min_opt(next_timer, next_inbound)
+    }
+
+    fn is_idle(&self) -> bool {
+        let t = self.next_wakeup();
+        t == self.timers[Timer::Idle as usize] || t == self.timers[Timer::KeepAlive as usize]
     }
 
     fn delay_outbound(&mut self) {
@@ -369,12 +374,13 @@ fn version_negotiate() {
     let client_addr = "[::2]:7890".parse().unwrap();
     let mut server = Endpoint::new(
         log.new(o!("peer" => "server")),
-        Config::default(),
-        Some(server_config()),
+        Default::default(),
+        Some(Arc::new(server_config())),
     )
     .unwrap();
+    let now = Instant::now();
     server.handle(
-        0,
+        now,
         client_addr,
         None,
         // Long-header packet with reserved version number
@@ -385,7 +391,7 @@ fn version_negotiate() {
         )[..]
             .into(),
     );
-    let io = server.poll_transmit(0);
+    let io = server.poll_transmit(now);
     assert!(io.is_some());
     if let Some(Transmit { packet, .. }) = io {
         assert_ne!(packet[0] & 0x80, 0);
@@ -394,7 +400,7 @@ fn version_negotiate() {
             .chunks(4)
             .any(|x| BigEndian::read_u32(x) == VERSION));
     }
-    assert_matches!(server.poll_transmit(0), None);
+    assert_matches!(server.poll_transmit(now), None);
     assert_matches!(server.poll(), None);
 }
 
@@ -421,8 +427,7 @@ fn lifecycle() {
 #[test]
 fn stateless_retry() {
     let mut pair = Pair::new(
-        Config::default(),
-        Config::default(),
+        Default::default(),
         ServerConfig {
             use_stateless_retry: true,
             ..server_config()
@@ -438,22 +443,18 @@ fn server_stateless_reset() {
     rng.fill_bytes(&mut reset_value);
 
     let reset_key = SigningKey::new(&digest::SHA512_256, &reset_value);
-    let reset_key_2 = SigningKey::new(&digest::SHA512_256, &reset_value);
 
-    let server = Config {
+    let endpoint_config = Arc::new(EndpointConfig {
         reset_key,
-        ..Config::default()
-    };
+        ..Default::default()
+    });
 
-    let mut pair = Pair::new(server, Config::default(), server_config());
+    let mut pair = Pair::new(endpoint_config.clone(), server_config());
     let (client_ch, _) = pair.connect();
     pair.server.endpoint = Endpoint::new(
         pair.log.new(o!("side" => "Server")),
-        Config {
-            reset_key: reset_key_2,
-            ..Config::default()
-        },
-        Some(server_config()),
+        endpoint_config,
+        Some(Arc::new(server_config())),
     )
     .unwrap();
     // Send something big enough to allow room for a smaller stateless reset.
@@ -471,22 +472,18 @@ fn client_stateless_reset() {
     rng.fill_bytes(&mut reset_value);
 
     let reset_key = SigningKey::new(&digest::SHA512_256, &reset_value);
-    let reset_key_2 = SigningKey::new(&digest::SHA512_256, &reset_value);
 
-    let client = Config {
+    let endpoint_config = Arc::new(EndpointConfig {
         reset_key,
-        ..Config::default()
-    };
+        ..Default::default()
+    });
 
-    let mut pair = Pair::new(Config::default(), client, server_config());
+    let mut pair = Pair::new(endpoint_config.clone(), server_config());
     let (_, server_ch) = pair.connect();
     pair.client.endpoint = Endpoint::new(
         pair.log.new(o!("side" => "Client")),
-        Config {
-            reset_key: reset_key_2,
-            ..Config::default()
-        },
-        Some(server_config()),
+        endpoint_config,
+        Some(Arc::new(server_config())),
     )
     .unwrap();
     // Send something big enough to allow room for a smaller stateless reset.
@@ -539,7 +536,6 @@ fn reset_stream() {
 
     assert_matches!(pair.server.poll(), Some((conn, Event::StreamOpened)) if conn == server_ch);
     assert_matches!(pair.server.accept_stream(server_ch), Some(stream) if stream == s);
-    assert_matches!(pair.server.poll(), Some((conn, Event::StreamReadable { stream })) if conn == server_ch && stream == s);
     assert_matches!(
         pair.server.read_unordered(server_ch, s),
         Err(ReadError::Reset { error_code: ERROR })
@@ -564,7 +560,6 @@ fn stop_stream() {
 
     assert_matches!(pair.server.poll(), Some((conn, Event::StreamOpened)) if conn == server_ch);
     assert_matches!(pair.server.accept_stream(server_ch), Some(stream) if stream == s);
-    assert_matches!(pair.server.poll(), Some((conn, Event::StreamReadable { stream })) if conn == server_ch && stream == s);
     assert_matches!(
         pair.server.read_unordered(server_ch, s),
         Err(ReadError::Reset { error_code: ERROR })
@@ -586,13 +581,17 @@ fn reject_self_signed_cert() {
     info!(pair.log, "connecting");
     let client_ch = pair
         .client
-        .connect(pair.server.addr, &Arc::new(client_config), "localhost")
+        .connect(
+            pair.server.addr,
+            Default::default(),
+            Arc::new(client_config),
+            "localhost",
+        )
         .unwrap();
     pair.drive();
     assert_matches!(pair.client.poll(),
-                    Some((conn, Event::ConnectionLost { reason: ConnectionError::TransportError {
-                        error_code
-                    }})) if conn == client_ch && error_code == TransportError::crypto(AlertDescription::BadCertificate));
+                    Some((conn, Event::ConnectionLost { reason: ConnectionError::TransportError(ref error)}))
+                    if conn == client_ch && error.code == TransportErrorCode::crypto(AlertDescription::BadCertificate.get_u8()));
 }
 
 #[test]
@@ -624,7 +623,7 @@ fn congestion() {
 #[test]
 fn high_latency_handshake() {
     let mut pair = Pair::default();
-    pair.latency = 200 * 1000;
+    pair.latency = Duration::from_micros(200 * 1000);
     let (client_ch, server_ch) = pair.connect();
     assert_eq!(pair.client.connection(client_ch).bytes_in_flight(), 0);
     assert_eq!(pair.server.connection(server_ch).bytes_in_flight(), 0);
@@ -640,7 +639,12 @@ fn zero_rtt() {
     // Establish normal connection
     let client_ch = pair
         .client
-        .connect(pair.server.addr, &config, "localhost")
+        .connect(
+            pair.server.addr,
+            Default::default(),
+            config.clone(),
+            "localhost",
+        )
         .unwrap();
     pair.drive();
     pair.server.assert_accept();
@@ -654,7 +658,7 @@ fn zero_rtt() {
     info!(pair.log, "resuming session");
     let client_ch = pair
         .client
-        .connect(pair.server.addr, &config, "localhost")
+        .connect(pair.server.addr, Default::default(), config, "localhost")
         .unwrap();
     assert!(pair.client.connection(client_ch).has_0rtt());
     let s = pair.client.open(client_ch, Directionality::Uni).unwrap();
@@ -675,12 +679,21 @@ fn zero_rtt_rejection() {
     // Establish normal connection
     let client_conn = pair
         .client
-        .connect(pair.server.addr, &config, "localhost")
+        .connect(
+            pair.server.addr,
+            Default::default(),
+            config.clone(),
+            "localhost",
+        )
         .unwrap();
     pair.drive();
     pair.server.assert_accept();
+    assert_matches!(pair.server.poll(), Some((_, Event::Connected)));
+    assert_matches!(pair.server.poll(), None);
     pair.client.close(pair.time, client_conn, 0, [][..].into());
     pair.drive();
+    assert_matches!(pair.server.poll(), Some((_, Event::ConnectionLost { .. })));
+    assert_matches!(pair.server.poll(), None);
 
     // Changing protocols invalidates 0-RTT
     Arc::get_mut(&mut config)
@@ -689,7 +702,7 @@ fn zero_rtt_rejection() {
     info!(pair.log, "resuming session");
     let client_conn = pair
         .client
-        .connect(pair.server.addr, &config, "localhost")
+        .connect(pair.server.addr, Default::default(), config, "localhost")
         .unwrap();
     assert!(pair.client.connection(client_conn).has_0rtt());
     let s = pair.client.open(client_conn, Directionality::Uni).unwrap();
@@ -698,8 +711,12 @@ fn zero_rtt_rejection() {
     pair.drive();
     assert!(!pair.client.connection(client_conn).accepted_0rtt());
     let server_conn = pair.server.assert_accept();
-    assert_matches!(
-        pair.server.read_unordered(server_conn, s),
+    assert_matches!(pair.server.poll(), Some((_, Event::Connected)));
+    assert_matches!(pair.server.poll(), None);
+    let s2 = pair.client.open(client_conn, Directionality::Uni).unwrap();
+    assert_eq!(s, s2);
+    assert_eq!(
+        pair.server.read_unordered(server_conn, s2),
         Err(ReadError::Blocked)
     );
     assert_eq!(pair.client.connection(client_conn).lost_packets(), 0);
@@ -710,7 +727,12 @@ fn close_during_handshake() {
     let mut pair = Pair::default();
     let c = pair
         .client
-        .connect(pair.server.addr, &client_config(), "localhost")
+        .connect(
+            pair.server.addr,
+            Default::default(),
+            client_config(),
+            "localhost",
+        )
         .unwrap();
     pair.client.close(pair.time, c, 0, Bytes::new());
     // This never actually sends the client's Initial; we may want to behave better here.
@@ -718,11 +740,14 @@ fn close_during_handshake() {
 
 #[test]
 fn stream_id_backpressure() {
-    let server = Config {
-        stream_window_uni: 1,
-        ..Config::default()
+    let server = ServerConfig {
+        transport_config: Arc::new(TransportConfig {
+            stream_window_uni: 1,
+            ..TransportConfig::default()
+        }),
+        ..server_config()
     };
-    let mut pair = Pair::new(server, Default::default(), server_config());
+    let mut pair = Pair::new(Default::default(), server);
     let (client_ch, server_ch) = pair.connect();
 
     let s = pair
@@ -828,7 +853,6 @@ fn key_update_reordered() {
 
     assert_matches!(pair.server.poll(), Some((conn, Event::StreamOpened)) if conn == server_ch);
     assert_matches!(pair.server.accept_stream(server_ch), Some(stream) if stream == s);
-    assert_matches!(pair.server.poll(), Some((conn, Event::StreamReadable { stream })) if conn == server_ch && stream == s);
     assert_matches!(pair.server.poll(), None);
     assert_matches!(
         pair.server.read_unordered(server_ch, s),
@@ -847,7 +871,12 @@ fn initial_retransmit() {
     let mut pair = Pair::default();
     let client_ch = pair
         .client
-        .connect(pair.server.addr, &client_config(), "localhost")
+        .connect(
+            pair.server.addr,
+            Default::default(),
+            client_config(),
+            "localhost",
+        )
         .unwrap();
     pair.client.drive(&pair.log, pair.time, pair.server.addr);
     pair.client.outbound.clear(); // Drop initial
@@ -861,7 +890,12 @@ fn instant_close() {
     info!(pair.log, "connecting");
     let client_ch = pair
         .client
-        .connect(pair.server.addr, &client_config(), "localhost")
+        .connect(
+            pair.server.addr,
+            Default::default(),
+            client_config(),
+            "localhost",
+        )
         .unwrap();
     pair.client.close(pair.time, client_ch, 0, Bytes::new());
     pair.drive();
@@ -875,7 +909,12 @@ fn instant_close_2() {
     info!(pair.log, "connecting");
     let client_ch = pair
         .client
-        .connect(pair.server.addr, &client_config(), "localhost")
+        .connect(
+            pair.server.addr,
+            Default::default(),
+            client_config(),
+            "localhost",
+        )
         .unwrap();
     // Unlike `instant_close`, the server sees a valid Initial packet first.
     pair.drive_client();
@@ -890,17 +929,31 @@ fn instant_close_2() {
 
 #[test]
 fn idle_timeout() {
-    let mut pair = Pair::default();
+    const IDLE_TIMEOUT: u64 = 10;
+    let server = ServerConfig {
+        transport_config: Arc::new(TransportConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
     let (client_ch, server_ch) = pair.connect();
     pair.client.ping(client_ch);
+    let start = pair.time;
+
     while !pair.client.connection(client_ch).is_closed()
         || !pair.server.connection(server_ch).is_closed()
     {
-        pair.step();
-        pair.client.inbound.clear();
-        pair.time = pair.client.next_wakeup();
+        if !pair.step() {
+            if let Some(t) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
+                pair.time = t;
+            }
+        }
+        pair.client.inbound.clear(); // Simulate total S->C packet loss
     }
-    assert!(pair.time != u64::max_value());
+
+    assert!(pair.time - start < 2 * Duration::from_secs(IDLE_TIMEOUT));
     assert_matches!(
         pair.client.poll(),
         Some((
@@ -924,15 +977,19 @@ fn idle_timeout() {
 #[test]
 fn server_busy() {
     let mut pair = Pair::new(
-        Config::default(),
-        Config::default(),
+        Default::default(),
         ServerConfig {
             accept_buffer: 0,
             ..server_config()
         },
     );
     pair.client
-        .connect(pair.server.addr, &client_config(), "localhost")
+        .connect(
+            pair.server.addr,
+            Default::default(),
+            client_config(),
+            "localhost",
+        )
         .unwrap();
     pair.drive();
     assert_matches!(
@@ -944,7 +1001,7 @@ fn server_busy() {
                     ConnectionError::ConnectionClosed {
                         reason:
                             frame::ConnectionClose {
-                                error_code: TransportError::SERVER_BUSY,
+                                error_code: TransportErrorCode::SERVER_BUSY,
                                 ..
                             },
                     },
@@ -959,7 +1016,12 @@ fn server_hs_retransmit() {
     let mut pair = Pair::default();
     let client_ch = pair
         .client
-        .connect(pair.server.addr, &client_config(), "localhost")
+        .connect(
+            pair.server.addr,
+            Default::default(),
+            client_config(),
+            "localhost",
+        )
         .unwrap();
     pair.step();
     assert!(pair.client.inbound.len() > 1); // Initial + Handshakes
@@ -990,7 +1052,12 @@ fn decode_coalesced() {
     let mut pair = Pair::default();
     let client_ch = pair
         .client
-        .connect(pair.server.addr, &client_config(), "localhost")
+        .connect(
+            pair.server.addr,
+            Default::default(),
+            client_config(),
+            "localhost",
+        )
         .unwrap();
     pair.step();
     assert!(
@@ -1023,8 +1090,14 @@ fn migration() {
     assert_eq!(pair.server.connection(server_ch).remote(), pair.client.addr);
 }
 
-fn test_flow_control(config: Config, window_size: usize) {
-    let mut pair = Pair::new(config, Config::default(), server_config());
+fn test_flow_control(config: TransportConfig, window_size: usize) {
+    let mut pair = Pair::new(
+        Default::default(),
+        ServerConfig {
+            transport_config: Arc::new(config),
+            ..server_config()
+        },
+    );
     let (client_conn, server_conn) = pair.connect();
     let msg = vec![0xAB; window_size + 10];
     let mut buf = [0; 4096];
@@ -1032,6 +1105,10 @@ fn test_flow_control(config: Config, window_size: usize) {
     // Stream reset before read
     let s = pair.client.open(client_conn, Directionality::Uni).unwrap();
     assert_eq!(pair.client.write(client_conn, s, &msg), Ok(window_size));
+    assert_eq!(
+        pair.client.write(client_conn, s, &msg[window_size..]),
+        Err(WriteError::Blocked)
+    );
     pair.drive();
     pair.client.reset(client_conn, s, 42);
     pair.drive();
@@ -1043,6 +1120,10 @@ fn test_flow_control(config: Config, window_size: usize) {
     // Happy path
     let s = pair.client.open(client_conn, Directionality::Uni).unwrap();
     assert_eq!(pair.client.write(client_conn, s, &msg), Ok(window_size));
+    assert_eq!(
+        pair.client.write(client_conn, s, &msg[window_size..]),
+        Err(WriteError::Blocked)
+    );
     pair.drive();
     let mut cursor = 0;
     loop {
@@ -1061,6 +1142,10 @@ fn test_flow_control(config: Config, window_size: usize) {
     assert_eq!(cursor, window_size);
     pair.drive();
     assert_eq!(pair.client.write(client_conn, s, &msg), Ok(window_size));
+    assert_eq!(
+        pair.client.write(client_conn, s, &msg[window_size..]),
+        Err(WriteError::Blocked)
+    );
     pair.drive();
     let mut cursor = 0;
     loop {
@@ -1082,9 +1167,9 @@ fn test_flow_control(config: Config, window_size: usize) {
 #[test]
 fn stream_flow_control() {
     test_flow_control(
-        Config {
+        TransportConfig {
             stream_receive_window: 2000,
-            ..Config::default()
+            ..TransportConfig::default()
         },
         2000,
     );
@@ -1093,9 +1178,9 @@ fn stream_flow_control() {
 #[test]
 fn conn_flow_control() {
     test_flow_control(
-        Config {
+        TransportConfig {
             receive_window: 2000,
-            ..Config::default()
+            ..TransportConfig::default()
         },
         2000,
     );
@@ -1120,4 +1205,71 @@ fn stop_opens_bidi() {
         pair.server.write(server_conn, s, b"foo"),
         Err(WriteError::Stopped { error_code: ERROR })
     );
+}
+
+#[test]
+fn implicit_open() {
+    let mut pair = Pair::default();
+    let (client_conn, server_conn) = pair.connect();
+    let s1 = pair.client.open(client_conn, Directionality::Uni).unwrap();
+    let s2 = pair.client.open(client_conn, Directionality::Uni).unwrap();
+    pair.client.write(client_conn, s2, b"hello").unwrap();
+    pair.drive();
+    assert_matches!(pair.server.poll(), Some((conn, Event::StreamOpened)) if conn == server_conn);
+    assert_eq!(pair.server.accept_stream(server_conn), Some(s1));
+    assert_eq!(pair.server.accept_stream(server_conn), Some(s2));
+    assert_eq!(pair.server.accept_stream(server_conn), None);
+}
+
+#[test]
+fn zero_length_cid() {
+    let mut pair = Pair::new(
+        Arc::new(EndpointConfig {
+            local_cid_len: 0,
+            ..EndpointConfig::default()
+        }),
+        server_config(),
+    );
+    let (client_ch, server_ch) = pair.connect();
+    // Ensure we can reconnect after a previous connection is cleaned up
+    info!(pair.log, "closing");
+    pair.client.close(pair.time, client_ch, 42, Bytes::new());
+    pair.drive();
+    pair.server.close(pair.time, server_ch, 42, Bytes::new());
+    pair.connect();
+}
+
+#[test]
+fn keep_alive() {
+    const IDLE_TIMEOUT: u64 = 10;
+    let server = ServerConfig {
+        transport_config: Arc::new(TransportConfig {
+            keep_alive_interval: IDLE_TIMEOUT as u32 / 2,
+            idle_timeout: IDLE_TIMEOUT,
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+    // Run a good while longer than the idle timeout
+    let end = pair.time + Duration::new(20 * IDLE_TIMEOUT, 0);
+    while pair.time < end {
+        if !pair.step() {
+            if let Some(time) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
+                pair.time = time;
+            }
+        }
+        assert!(!pair.client.connection(client_ch).is_closed());
+        assert!(!pair.server.connection(server_ch).is_closed());
+    }
+}
+
+fn min_opt<T: Ord>(x: Option<T>, y: Option<T>) -> Option<T> {
+    match (x, y) {
+        (Some(x), Some(y)) => Some(cmp::min(x, y)),
+        (Some(x), _) => Some(x),
+        (_, Some(y)) => Some(y),
+        _ => None,
+    }
 }
